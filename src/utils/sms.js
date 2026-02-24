@@ -5,13 +5,12 @@ const logger = require('./logger');
  * Send OTP via Fast2SMS (works well in India)
  * Replace with Twilio / MSG91 as needed
  */
-const sendSMS = async (phone, message) => {
-  console.log("=================================");
-  console.log("DEV MODE - SMS NOT SENT");
-  console.log("Phone:", phone);
-  console.log("Message:", message);
-  console.log("=================================");
+const sendSMS = async (phone, otp) => {
+  console.log("DEV MODE OTP:", phone, otp);
   return true;
+
+
+module.exports = { sendSMS };
 
 module.exports = { sendSMS };
 
