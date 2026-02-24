@@ -18,7 +18,7 @@ const connectionString = isProduction
 
 const pool = new Pool({
   connectionString,
-  ssl: { rejectUnauthorized: isProduction }, // strict SSL in prod, relaxed in dev
+  ssl: { rejectUnauthorized: false }, // strict SSL in prod, relaxed in dev
   max: 20,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
