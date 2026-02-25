@@ -50,7 +50,14 @@ const updateProfileSchema = z.object({
   avatar: z.string().url().optional(),
 });
 
+
+const changePasswordSchema = z.object({
+  currentPassword: z.string().min(1, 'Current password is required'),
+  newPassword:     z.string().min(8, 'New password must be at least 8 characters'),
+});
+
 const addressSchema = z.object({
+  label:     z.enum(["Home", "Work", "Other"]).optional(),
   name:      z.string().min(2).max(100),
   phone:     z.string().regex(/^[6-9]\d{9}$/),
   street:    z.string().min(5).max(500),
@@ -196,6 +203,7 @@ module.exports = {
     googleAuth:      googleAuthSchema,
     refreshToken:    refreshTokenSchema,
     updateProfile:   updateProfileSchema,
+    changePassword:  changePasswordSchema,
     address:         addressSchema,
     restaurantQuery: restaurantQuerySchema,
     restaurant:      restaurantSchema,

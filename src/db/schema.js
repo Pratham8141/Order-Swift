@@ -9,19 +9,22 @@ const orderStatusEnum = pgEnum('order_status', [
   'pending', 'paid', 'confirmed', 'preparing', 'ready', 'collected', 'cancelled',
 ]);
 const paymentStatusEnum = pgEnum('payment_status', ['pending', 'paid', 'failed', 'refunded']);
+const notifTypeEnum = pgEnum('notif_type', ['order_status', 'promo', 'system']);
 
 // ─── Users ────────────────────────────────────────────────────────────────────
 const users = pgTable('users', {
-  id:        uuid('id').primaryKey().defaultRandom(),
-  name:      varchar('name',  { length: 100 }),
-  email:     varchar('email', { length: 255 }),
-  phone:     varchar('phone', { length: 20 }),
-  avatar:    text('avatar'),
-  role:      userRoleEnum('role').default('user').notNull(),
-  isActive:  boolean('is_active').default(true).notNull(),
-  googleId:  varchar('google_id', { length: 255 }),
-  createdAt: timestamp('created_at').defaultNow().notNull(),
-  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+  id:             uuid('id').primaryKey().defaultRandom(),
+  name:           varchar('name',  { length: 100 }),
+  email:          varchar('email', { length: 255 }),
+  phone:          varchar('phone', { length: 20 }),
+  avatar:         text('avatar'),
+  role:           userRoleEnum('role').default('user').notNull(),
+  passwordHash:   text('password_hash'),
+  expoPushToken:  text('expo_push_token'),
+  isActive:       boolean('is_active').default(true).notNull(),
+  googleId:       varchar('google_id', { length: 255 }),
+  createdAt:      timestamp('created_at').defaultNow().notNull(),
+  updatedAt:      timestamp('updated_at').defaultNow().notNull(),
 }, (t) => ({
   emailIdx:  uniqueIndex('users_email_idx').on(t.email),
   phoneIdx:  uniqueIndex('users_phone_idx').on(t.phone),
@@ -54,10 +57,10 @@ const refreshTokens = pgTable('refresh_tokens', {
 }));
 
 // ─── Addresses ────────────────────────────────────────────────────────────────
-// Kept for user profile management — not required for order placement (takeaway).
 const addresses = pgTable('addresses', {
   id:        uuid('id').primaryKey().defaultRandom(),
   userId:    uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  label:     varchar('label', { length: 20 }).default('Home'),   // Home / Work / Other
   name:      varchar('name',  { length: 100 }).notNull(),
   phone:     varchar('phone', { length: 20 }).notNull(),
   street:    text('street').notNull(),
@@ -82,7 +85,6 @@ const restaurants = pgTable('restaurants', {
   bannerImage:  text('banner_image'),
   rating:       decimal('rating', { precision: 3, scale: 2 }).default('0.00'),
   totalReviews: integer('total_reviews').default(0),
-  // preparationTime: default minutes a restaurant takes to prepare an order
   preparationTime: integer('preparation_time').default(20),
   minOrder:     decimal('min_order', { precision: 8, scale: 2 }).default('0.00'),
   isActive:     boolean('is_active').default(true).notNull(),
@@ -172,7 +174,7 @@ const cartItems = pgTable('cart_items', {
   cartId:     uuid('cart_id').references(() => carts.id, { onDelete: 'cascade' }).notNull(),
   menuItemId: uuid('menu_item_id').references(() => menuItems.id, { onDelete: 'cascade' }).notNull(),
   variantId:  uuid('variant_id').references(() => menuItemVariants.id, { onDelete: 'set null' }),
-  addOns:     jsonb('add_ons').default([]),      // [{addOnId, name, price}]
+  addOns:     jsonb('add_ons').default([]),
   quantity:   integer('quantity').default(1).notNull(),
   createdAt:  timestamp('created_at').defaultNow().notNull(),
   updatedAt:  timestamp('updated_at').defaultNow().notNull(),
@@ -182,8 +184,6 @@ const cartItems = pgTable('cart_items', {
 }));
 
 // ─── Orders ───────────────────────────────────────────────────────────────────
-// TAKEAWAY ONLY — no deliveryFee, no taxAmount, no addressId requirement.
-// Pricing: totalAmount = subtotal - discountAmount
 const orders = pgTable('orders', {
   id:               uuid('id').primaryKey().defaultRandom(),
   userId:           uuid('user_id').references(() => users.id, { onDelete: 'restrict' }).notNull(),
@@ -195,10 +195,10 @@ const orders = pgTable('orders', {
   subtotal:         decimal('subtotal',       { precision: 10, scale: 2 }).notNull(),
   discountAmount:   decimal('discount_amount', { precision: 10, scale: 2 }).default('0.00'),
   totalAmount:      decimal('total_amount',    { precision: 10, scale: 2 }).notNull(),
-  couponCode:       varchar('coupon_code',     { length: 50 }),             // #8 — coupon placeholder
-  pickupName:       varchar('pickup_name',     { length: 100 }),            // who will collect
+  couponCode:       varchar('coupon_code',     { length: 50 }),
+  pickupName:       varchar('pickup_name',     { length: 100 }),
   notes:            text('notes'),
-  preparationTime:  integer('preparation_time'),                            // #7 — renamed from estimatedTime
+  preparationTime:  integer('preparation_time'),
   createdAt:        timestamp('created_at').defaultNow().notNull(),
   updatedAt:        timestamp('updated_at').defaultNow().notNull(),
 }, (t) => ({
@@ -212,11 +212,11 @@ const orderItems = pgTable('order_items', {
   id:          uuid('id').primaryKey().defaultRandom(),
   orderId:     uuid('order_id').references(() => orders.id, { onDelete: 'cascade' }).notNull(),
   menuItemId:  uuid('menu_item_id').references(() => menuItems.id, { onDelete: 'restrict' }).notNull(),
-  name:        varchar('name', { length: 255 }).notNull(),  // snapshot
+  name:        varchar('name', { length: 255 }).notNull(),
   variantName: varchar('variant_name', { length: 100 }),
   addOns:      jsonb('add_ons').default([]),
   quantity:    integer('quantity').notNull(),
-  unitPrice:   decimal('unit_price',  { precision: 8,  scale: 2 }).notNull(), // snapshot
+  unitPrice:   decimal('unit_price',  { precision: 8,  scale: 2 }).notNull(),
   totalPrice:  decimal('total_price', { precision: 10, scale: 2 }).notNull(),
   createdAt:   timestamp('created_at').defaultNow().notNull(),
 }, (t) => ({
@@ -238,11 +238,37 @@ const reviews = pgTable('reviews', {
   userOrderIdx:  uniqueIndex('reviews_user_order_idx').on(t.userId, t.orderId),
 }));
 
+// ─── Favorites ────────────────────────────────────────────────────────────────
+const favorites = pgTable('favorites', {
+  id:           uuid('id').primaryKey().defaultRandom(),
+  userId:       uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  restaurantId: uuid('restaurant_id').references(() => restaurants.id, { onDelete: 'cascade' }).notNull(),
+  createdAt:    timestamp('created_at').defaultNow().notNull(),
+}, (t) => ({
+  uniqueFav: uniqueIndex('favorites_user_restaurant_idx').on(t.userId, t.restaurantId),
+}));
+
+// ─── Notifications ────────────────────────────────────────────────────────────
+const notifications = pgTable('notifications', {
+  id:          uuid('id').primaryKey().defaultRandom(),
+  userId:      uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  title:       varchar('title', { length: 255 }).notNull(),
+  body:        text('body').notNull(),
+  type:        notifTypeEnum('type').default('system').notNull(),
+  referenceId: uuid('reference_id'),   // orderId for order_status notifications
+  isRead:      boolean('is_read').default(false).notNull(),
+  createdAt:   timestamp('created_at').defaultNow().notNull(),
+}, (t) => ({
+  userIdx: index('notifications_user_idx').on(t.userId),
+}));
+
 module.exports = {
   users, otps, refreshTokens, addresses,
   restaurants, categories, menuItems, menuItemVariants, addOns,
   carts, cartItems,
   orders, orderItems,
   reviews,
-  userRoleEnum, orderStatusEnum, paymentStatusEnum,
+  favorites,
+  notifications,
+  userRoleEnum, orderStatusEnum, paymentStatusEnum, notifTypeEnum,
 };

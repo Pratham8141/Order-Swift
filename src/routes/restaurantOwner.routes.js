@@ -20,6 +20,7 @@ const {
 } = require('../db/schema');
 const { eq, and, desc } = require('drizzle-orm');
 const logger = require('../utils/logger');
+const { notifyOrderStatusChange } = require('../utils/notifications');
 
 // Apply auth + role guard to ALL routes in this file
 router.use(protect, authorize('restaurant_owner'));
@@ -200,6 +201,16 @@ router.get('/menu', asyncHandler(async (req, res) => {
     .where(eq(menuItems.restaurantId, restaurant.id));
 
   return sendSuccess(res, { restaurantId: restaurant.id, items });
+}));
+
+/**
+ * GET /api/v1/owner/menu-item/:id
+ * Fetch single menu item for edit form pre-fill.
+ */
+router.get('/menu-item/:id', asyncHandler(async (req, res) => {
+  const restaurant = await getOwnedRestaurant(req.user.id);
+  const item = await assertMenuItemOwnership(req.params.id, restaurant.id);
+  return sendSuccess(res, item);
 }));
 
 router.post('/menu-item', asyncHandler(async (req, res) => {
@@ -403,6 +414,8 @@ router.patch('/order/:id/status', asyncHandler(async (req, res) => {
     .where(eq(orders.id, order.id))
     .returning();
 
+  // Fire notification async (non-blocking)
+  notifyOrderStatusChange(updated).catch(err => logger.error('Notification failed', { error: err.message }));
   return sendSuccess(res, updated, `Order status updated to '${newStatus}'`);
 }));
 
