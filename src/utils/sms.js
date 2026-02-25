@@ -11,7 +11,6 @@ const sendSMS = async (phone, otp) => {
 
 
 module.exports = { sendSMS };
-
 module.exports = { sendSMS };
 
   const payload = JSON.stringify({

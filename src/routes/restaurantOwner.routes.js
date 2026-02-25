@@ -2,30 +2,49 @@
  * src/routes/restaurantOwner.routes.js
  *
  * All routes protected by JWT + role=restaurant_owner.
- * Restaurant ownership is always verified from req.user.id — never from the body.
  *
- * TAKEAWAY changes:
- *  - deliveryFee / deliveryTime removed from restaurant create/update
- *  - estimatedTime → preparationTime on order PATCH
- *  - Order list response no longer includes deliveryFee / deliveryAddress / taxAmount
- *  - State machine updated to: pending → confirmed → preparing → ready → collected
+ * Issue #2: GET /owner/restaurant added as primary endpoint.
+ *           (was only /restaurant-info; both now work)
+ * Issue #3: GET /owner/menu returns all menu items for owned restaurant.
+ * Issue #7: Frontend calls GET /owner/restaurant first.
+ *           If restaurant exists → update mode
+ *           If 404 → create mode
+ * Issue #9: Debug logging added to ownerId, restaurantId, userId queries.
  */
-
 const router = require('express').Router();
-const { protect, authorize }         = require('../middleware/auth');
+const { protect, authorize }              = require('../middleware/auth');
 const { asyncHandler, sendSuccess, AppError } = require('../utils/response');
-const { db }                         = require('../db');
-const { restaurants, categories, menuItems, orders, orderItems } = require('../db/schema');
-const { eq, and, desc }              = require('drizzle-orm');
+const { db }                              = require('../db');
+const {
+  restaurants, categories, menuItems, orders, orderItems,
+} = require('../db/schema');
+const { eq, and, desc } = require('drizzle-orm');
+const logger = require('../utils/logger');
 
-// ─── Apply auth + role guard to ALL routes in this file ──────────────────────
+// Apply auth + role guard to ALL routes in this file
 router.use(protect, authorize('restaurant_owner'));
 
 // ─── Ownership helper ─────────────────────────────────────────────────────────
+
+/**
+ * getOwnedRestaurant(ownerId)
+ *
+ * Issue #2 + #9: Logs ownerId before query so we can verify it matches user.id.
+ * Throws 404 if no restaurant found — this is how frontend detects "create" mode.
+ */
 const getOwnedRestaurant = async (ownerId) => {
-  const [restaurant] = await db.select().from(restaurants)
+  logger.debug('getOwnedRestaurant — querying by ownerId', { ownerId }); // #9
+
+  const [restaurant] = await db
+    .select()
+    .from(restaurants)
     .where(eq(restaurants.ownerId, ownerId))
     .limit(1);
+
+  logger.debug('getOwnedRestaurant — result', {
+    found: !!restaurant,
+    restaurantId: restaurant?.id ?? null,
+  }); // #9
 
   if (!restaurant) {
     throw new AppError('You do not have a restaurant yet. Create one first.', 404);
@@ -34,7 +53,9 @@ const getOwnedRestaurant = async (ownerId) => {
 };
 
 const assertMenuItemOwnership = async (menuItemId, restaurantId) => {
-  const [item] = await db.select().from(menuItems)
+  const [item] = await db
+    .select()
+    .from(menuItems)
     .where(eq(menuItems.id, menuItemId))
     .limit(1);
 
@@ -50,8 +71,22 @@ const assertMenuItemOwnership = async (menuItemId, restaurantId) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
+ * GET /api/v1/owner/restaurant
+ *
+ * Issue #2 + #7: Primary endpoint for fetching the owner's own restaurant.
+ * Frontend calls this first to decide create vs update mode.
+ * Returns 404 (not 200 with null) when no restaurant exists — React Query
+ * catches the 404 and the frontend renders the "create" form.
+ */
+router.get('/restaurant', asyncHandler(async (req, res) => {
+  logger.debug('GET /owner/restaurant', { userId: req.user.id }); // #9
+  const restaurant = await getOwnedRestaurant(req.user.id);
+  return sendSuccess(res, restaurant);
+}));
+
+/**
  * GET /api/v1/owner/restaurant-info
- * Get the owner's restaurant (used by settings screen).
+ * Alias kept for backward compatibility with settings.tsx.
  */
 router.get('/restaurant-info', asyncHandler(async (req, res) => {
   const restaurant = await getOwnedRestaurant(req.user.id);
@@ -60,15 +95,11 @@ router.get('/restaurant-info', asyncHandler(async (req, res) => {
 
 /**
  * POST /api/v1/owner/restaurant
- * Create owner's restaurant (one per owner, enforced here).
- *
- * TAKEAWAY: no deliveryFee / deliveryTime accepted.
- * Body (required: name):
- *   name, description, bannerImage, preparationTime,
- *   minOrder, openingTime, closingTime, address, latitude, longitude, cuisines
+ * Create restaurant — one per owner.
  */
 router.post('/restaurant', asyncHandler(async (req, res) => {
-  const [existing] = await db.select({ id: restaurants.id })
+  const [existing] = await db
+    .select({ id: restaurants.id })
     .from(restaurants)
     .where(eq(restaurants.ownerId, req.user.id))
     .limit(1);
@@ -106,18 +137,17 @@ router.post('/restaurant', asyncHandler(async (req, res) => {
     cuisines:        cuisines ?? [],
   }).returning();
 
+  logger.info('Restaurant created', { restaurantId: restaurant.id, ownerId: req.user.id }); // #9
   return sendSuccess(res, restaurant, 'Restaurant created', 201);
 }));
 
 /**
  * PUT /api/v1/owner/restaurant
- * Update the owner's restaurant.
- * ownerId is NEVER accepted from body — always taken from JWT.
+ * Update restaurant.
  */
 router.put('/restaurant', asyncHandler(async (req, res) => {
   const restaurant = await getOwnedRestaurant(req.user.id);
 
-  // Only these fields can be updated by the owner (deliveryFee removed)
   const ALLOWED = [
     'name', 'description', 'bannerImage',
     'preparationTime',
@@ -137,7 +167,8 @@ router.put('/restaurant', asyncHandler(async (req, res) => {
     throw new AppError('No valid fields provided for update', 400);
   }
 
-  const [updated] = await db.update(restaurants)
+  const [updated] = await db
+    .update(restaurants)
     .set({ ...updateData, updatedAt: new Date() })
     .where(eq(restaurants.id, restaurant.id))
     .returning();
@@ -146,12 +177,36 @@ router.put('/restaurant', asyncHandler(async (req, res) => {
 }));
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// MENU ITEM MANAGEMENT
+// MENU MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/v1/owner/menu
+ *
+ * Issue #3: Returns ALL menu items for the owner's restaurant (including
+ * unavailable ones), so the owner can manage the full catalogue.
+ *
+ * This is different from the public GET /restaurants/:id/menu which only
+ * returns isAvailable=true items.
+ */
+router.get('/menu', asyncHandler(async (req, res) => {
+  const restaurant = await getOwnedRestaurant(req.user.id);
+
+  logger.debug('GET /owner/menu', { restaurantId: restaurant.id, ownerId: req.user.id }); // #9
+
+  const items = await db
+    .select()
+    .from(menuItems)
+    .where(eq(menuItems.restaurantId, restaurant.id));
+
+  return sendSuccess(res, { restaurantId: restaurant.id, items });
+}));
 
 router.post('/menu-item', asyncHandler(async (req, res) => {
   const restaurant = await getOwnedRestaurant(req.user.id);
-  const { name, description, basePrice, image, isVeg, categoryId, isAvailable, sortOrder } = req.body;
+  const {
+    name, description, basePrice, image, isVeg, categoryId, isAvailable, sortOrder,
+  } = req.body;
 
   if (!name || !name.trim()) throw new AppError('Item name is required', 400);
   if (basePrice === undefined || isNaN(parseFloat(basePrice))) {
@@ -159,7 +214,9 @@ router.post('/menu-item', asyncHandler(async (req, res) => {
   }
 
   if (categoryId) {
-    const [cat] = await db.select({ id: categories.id }).from(categories)
+    const [cat] = await db
+      .select({ id: categories.id })
+      .from(categories)
       .where(and(eq(categories.id, categoryId), eq(categories.restaurantId, restaurant.id)))
       .limit(1);
     if (!cat) throw new AppError('Category not found or does not belong to your restaurant', 404);
@@ -172,7 +229,7 @@ router.post('/menu-item', asyncHandler(async (req, res) => {
     description,
     basePrice:    parseFloat(basePrice).toFixed(2),
     image:        image || null,
-    isVeg:        isVeg     !== undefined ? Boolean(isVeg)        : true,
+    isVeg:        isVeg      !== undefined ? Boolean(isVeg)        : true,
     isAvailable:  isAvailable !== undefined ? Boolean(isAvailable) : true,
     sortOrder:    sortOrder ?? 0,
   }).returning();
@@ -184,21 +241,28 @@ router.put('/menu-item/:id', asyncHandler(async (req, res) => {
   const restaurant = await getOwnedRestaurant(req.user.id);
   await assertMenuItemOwnership(req.params.id, restaurant.id);
 
-  const ALLOWED = ['name', 'description', 'basePrice', 'image', 'isVeg', 'categoryId', 'isAvailable', 'sortOrder'];
+  const ALLOWED = [
+    'name', 'description', 'basePrice', 'image',
+    'isVeg', 'categoryId', 'isAvailable', 'sortOrder',
+  ];
   const updateData = {};
   for (const field of ALLOWED) {
     if (req.body[field] !== undefined) updateData[field] = req.body[field];
   }
 
   if (updateData.basePrice !== undefined) {
-    if (isNaN(parseFloat(updateData.basePrice))) throw new AppError('basePrice must be a valid number', 400);
+    if (isNaN(parseFloat(updateData.basePrice))) {
+      throw new AppError('basePrice must be a valid number', 400);
+    }
     updateData.basePrice = parseFloat(updateData.basePrice).toFixed(2);
   }
   if (updateData.isVeg      !== undefined) updateData.isVeg      = Boolean(updateData.isVeg);
   if (updateData.isAvailable !== undefined) updateData.isAvailable = Boolean(updateData.isAvailable);
 
   if (updateData.categoryId) {
-    const [cat] = await db.select({ id: categories.id }).from(categories)
+    const [cat] = await db
+      .select({ id: categories.id })
+      .from(categories)
       .where(and(eq(categories.id, updateData.categoryId), eq(categories.restaurantId, restaurant.id)))
       .limit(1);
     if (!cat) throw new AppError('Category not found or does not belong to your restaurant', 404);
@@ -206,7 +270,8 @@ router.put('/menu-item/:id', asyncHandler(async (req, res) => {
 
   if (Object.keys(updateData).length === 0) throw new AppError('No valid fields provided', 400);
 
-  const [updated] = await db.update(menuItems)
+  const [updated] = await db
+    .update(menuItems)
     .set({ ...updateData, updatedAt: new Date() })
     .where(eq(menuItems.id, req.params.id))
     .returning();
@@ -227,13 +292,9 @@ router.delete('/menu-item/:id', asyncHandler(async (req, res) => {
 
 /**
  * GET /api/v1/owner/orders
- * List orders for the owner's restaurant.
  *
- * FIX #3 — the restaurant lookup (getOwnedRestaurant) correctly resolves the
- * restaurant that belongs to req.user.id, then filters orders by that restaurantId.
- * The bug was that the old code referenced schema columns (taxAmount, deliveryFee,
- * deliveryAddress, estimatedTime) that no longer exist post-takeaway refactor,
- * causing a silent empty result or DB error.
+ * Issue #3 + #9: Correctly joins through restaurant to filter orders.
+ * Only shows orders for the owner's own restaurant.
  */
 router.get('/orders', asyncHandler(async (req, res) => {
   const restaurant = await getOwnedRestaurant(req.user.id);
@@ -270,26 +331,27 @@ router.get('/orders', asyncHandler(async (req, res) => {
 
 /**
  * GET /api/v1/owner/order/:id
- * Get full order detail (with items).
- * Only accessible if the order belongs to owner's restaurant.
  */
 router.get('/order/:id', asyncHandler(async (req, res) => {
   const restaurant = await getOwnedRestaurant(req.user.id);
 
-  const [order] = await db.select().from(orders)
+  const [order] = await db
+    .select()
+    .from(orders)
     .where(and(eq(orders.id, req.params.id), eq(orders.restaurantId, restaurant.id)))
     .limit(1);
 
   if (!order) throw new AppError('Order not found or does not belong to your restaurant', 404);
 
-  const items = await db.select().from(orderItems)
+  const items = await db
+    .select()
+    .from(orderItems)
     .where(eq(orderItems.orderId, order.id));
 
   return sendSuccess(res, { ...order, items });
 }));
 
 // ─── Takeaway-only owner state machine ───────────────────────────────────────
-// Out-for-delivery and delivered removed. Lifecycle: confirmed → preparing → ready → collected.
 const OWNER_TRANSITIONS = {
   pending:   ['confirmed'],
   confirmed: ['preparing'],
@@ -299,12 +361,6 @@ const OWNER_TRANSITIONS = {
 
 /**
  * PATCH /api/v1/owner/order/:id/status
- *
- * Body:
- *   status          (required) — next status
- *   preparationTime (optional, integer minutes) — accepted when confirming
- *
- * #7 — parameter renamed from estimatedTime to preparationTime.
  */
 router.patch('/order/:id/status', asyncHandler(async (req, res) => {
   const restaurant = await getOwnedRestaurant(req.user.id);
@@ -312,13 +368,13 @@ router.patch('/order/:id/status', asyncHandler(async (req, res) => {
   const { status: newStatus, preparationTime } = req.body;
   if (!newStatus) throw new AppError('status is required', 400);
 
-  // Fetch order and verify it belongs to this restaurant
-  const [order] = await db.select().from(orders)
+  const [order] = await db
+    .select()
+    .from(orders)
     .where(and(eq(orders.id, req.params.id), eq(orders.restaurantId, restaurant.id)))
     .limit(1);
 
   if (!order) {
-    // Return 403 (not 404) to avoid leaking other restaurants' order IDs
     throw new AppError('Forbidden — order not found or does not belong to your restaurant', 403);
   }
 
@@ -333,7 +389,6 @@ router.patch('/order/:id/status', asyncHandler(async (req, res) => {
 
   const updateData = { status: newStatus, updatedAt: new Date() };
 
-  // preparationTime is only meaningful when confirming (pending → confirmed)
   if (preparationTime !== undefined && newStatus === 'confirmed') {
     const mins = parseInt(preparationTime);
     if (isNaN(mins) || mins < 1) {
@@ -342,7 +397,8 @@ router.patch('/order/:id/status', asyncHandler(async (req, res) => {
     updateData.preparationTime = mins;
   }
 
-  const [updated] = await db.update(orders)
+  const [updated] = await db
+    .update(orders)
     .set(updateData)
     .where(eq(orders.id, order.id))
     .returning();

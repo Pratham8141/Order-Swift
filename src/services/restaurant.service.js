@@ -1,34 +1,66 @@
+/**
+ * src/services/restaurant.service.js
+ *
+ * Fixes applied:
+ *  #1  — getRestaurants: removed stale deliveryTime / deliveryFee column
+ *        references (columns no longer exist after takeaway migration).
+ *        Replaced with preparationTime.
+ *  #1  — isActive default: the Zod schema bug (transform returning false when
+ *        param absent) is fixed in validations/index.js. The service itself
+ *        is fine — if isActive is undefined we add no condition, so all active
+ *        AND inactive rows are returned, which is intentional for admin use.
+ *        For the public listing the controller always passes isActive=true.
+ *  #9  — Added debug logging where useful.
+ */
 const { db } = require('../db');
 const { restaurants, categories, menuItems, menuItemVariants, addOns } = require('../db/schema');
-const { eq, and, gte, lte, ilike, sql } = require('drizzle-orm');
+const { eq, and, gte, ilike, sql, inArray } = require('drizzle-orm');
 const { AppError } = require('../utils/response');
+const logger = require('../utils/logger');
 
-const getRestaurants = async ({ page, limit, search, minRating, maxDelivery, isActive }) => {
+// ─── Public listing ───────────────────────────────────────────────────────────
+
+/**
+ * getRestaurants
+ *
+ * isActive behaviour:
+ *   - Public endpoint always passes isActive = true  → only active restaurants shown.
+ *   - Admin endpoint may pass isActive = false/undefined → unfiltered.
+ *   - If isActive is undefined no condition is added (returns all).
+ */
+const getRestaurants = async ({ page, limit, search, minRating, isActive }) => {
   const offset = (page - 1) * limit;
 
   const conditions = [];
-  if (isActive !== undefined) conditions.push(eq(restaurants.isActive, isActive));
-  if (search) conditions.push(ilike(restaurants.name, `%${search}%`));
-  if (minRating) conditions.push(gte(restaurants.rating, minRating.toString()));
-  if (maxDelivery) conditions.push(lte(restaurants.deliveryTime, maxDelivery));
+
+  // Only add the isActive filter when a value was explicitly provided.
+  // The fix for the Zod schema means undefined is no longer coerced to false.
+  if (isActive !== undefined) {
+    conditions.push(eq(restaurants.isActive, isActive));
+  }
+
+  if (search)     conditions.push(ilike(restaurants.name, `%${search}%`));
+  if (minRating)  conditions.push(gte(restaurants.rating, minRating.toString()));
+  // maxDelivery filter removed — deliveryTime column no longer exists
 
   const where = conditions.length > 0 ? and(...conditions) : undefined;
 
+  logger.debug('getRestaurants query', { isActive, search, minRating, page, limit });
+
   const [data, [{ count }]] = await Promise.all([
     db.select({
-      id: restaurants.id,
-      name: restaurants.name,
-      description: restaurants.description,
-      bannerImage: restaurants.bannerImage,
-      rating: restaurants.rating,
-      totalReviews: restaurants.totalReviews,
-      deliveryTime: restaurants.deliveryTime,
-      deliveryFee: restaurants.deliveryFee,
-      minOrder: restaurants.minOrder,
-      isActive: restaurants.isActive,
-      openingTime: restaurants.openingTime,
-      closingTime: restaurants.closingTime,
-      cuisines: restaurants.cuisines,
+      id:              restaurants.id,
+      name:            restaurants.name,
+      description:     restaurants.description,
+      bannerImage:     restaurants.bannerImage,
+      rating:          restaurants.rating,
+      totalReviews:    restaurants.totalReviews,
+      preparationTime: restaurants.preparationTime,   // ← renamed from deliveryTime
+      minOrder:        restaurants.minOrder,
+      isActive:        restaurants.isActive,
+      openingTime:     restaurants.openingTime,
+      closingTime:     restaurants.closingTime,
+      cuisines:        restaurants.cuisines,
     })
       .from(restaurants)
       .where(where)
@@ -37,11 +69,15 @@ const getRestaurants = async ({ page, limit, search, minRating, maxDelivery, isA
     db.select({ count: sql`COUNT(*)::int` }).from(restaurants).where(where),
   ]);
 
+  logger.debug('getRestaurants result', { count, returned: data.length });
+
   return {
     restaurants: data,
     pagination: { page, limit, total: count, pages: Math.ceil(count / limit) },
   };
 };
+
+// ─── Single restaurant ────────────────────────────────────────────────────────
 
 const getRestaurantById = async (id) => {
   const [restaurant] = await db.select().from(restaurants).where(eq(restaurants.id, id)).limit(1);
@@ -49,7 +85,11 @@ const getRestaurantById = async (id) => {
   return restaurant;
 };
 
+// ─── Public menu ──────────────────────────────────────────────────────────────
+
 const getMenu = async (restaurantId) => {
+  logger.debug('getMenu', { restaurantId }); // #9
+
   const [restaurant] = await db
     .select({ id: restaurants.id, name: restaurants.name, isActive: restaurants.isActive })
     .from(restaurants)
@@ -58,22 +98,20 @@ const getMenu = async (restaurantId) => {
 
   if (!restaurant) throw new AppError('Restaurant not found', 404);
 
-  // Get all categories with their items
   const cats = await db.select().from(categories)
     .where(and(eq(categories.restaurantId, restaurantId), eq(categories.isActive, true)));
 
   const items = await db.select().from(menuItems)
     .where(and(eq(menuItems.restaurantId, restaurantId), eq(menuItems.isAvailable, true)));
 
-  // Attach variants and add-ons
   const itemIds = items.map(i => i.id);
   let variants = [];
   let itemAddOns = [];
 
   if (itemIds.length > 0) {
     [variants, itemAddOns] = await Promise.all([
-      db.select().from(menuItemVariants).where(sql`${menuItemVariants.menuItemId} = ANY(${sql.raw(`ARRAY['${itemIds.join("','")}']::uuid[]`)})`),
-      db.select().from(addOns).where(sql`${addOns.menuItemId} = ANY(${sql.raw(`ARRAY['${itemIds.join("','")}']::uuid[]`)})`),
+      db.select().from(menuItemVariants).where(inArray(menuItemVariants.menuItemId, itemIds)),
+      db.select().from(addOns).where(inArray(addOns.menuItemId, itemIds)),
     ]);
   }
 
@@ -91,8 +129,8 @@ const getMenu = async (restaurantId) => {
 
   const enrichedItems = items.map(item => ({
     ...item,
-    variants: variantMap[item.id] || [],
-    addOns: addOnMap[item.id] || [],
+    variants:  variantMap[item.id]  || [],
+    addOns:    addOnMap[item.id]    || [],
   }));
 
   const menu = cats.map(cat => ({
@@ -100,7 +138,6 @@ const getMenu = async (restaurantId) => {
     items: enrichedItems.filter(i => i.categoryId === cat.id),
   }));
 
-  // Items without a category
   const uncategorized = enrichedItems.filter(i => !i.categoryId);
   if (uncategorized.length) {
     menu.push({ id: null, name: 'Other', items: uncategorized });
@@ -109,7 +146,27 @@ const getMenu = async (restaurantId) => {
   return { restaurant, menu };
 };
 
+// ─── Owner menu ───────────────────────────────────────────────────────────────
+// #3 — Returns ALL menu items (including unavailable) for the owner to manage.
+
+const getOwnerMenu = async (restaurantId, ownerId) => {
+  logger.debug('getOwnerMenu', { restaurantId, ownerId }); // #9
+
+  // Verify ownership
+  const [restaurant] = await db.select().from(restaurants)
+    .where(and(eq(restaurants.id, restaurantId), eq(restaurants.ownerId, ownerId)))
+    .limit(1);
+
+  if (!restaurant) throw new AppError('Restaurant not found or access denied', 403);
+
+  const items = await db.select().from(menuItems)
+    .where(eq(menuItems.restaurantId, restaurantId));
+
+  return items;
+};
+
 // ─── Admin CRUD ───────────────────────────────────────────────────────────────
+
 const createRestaurant = async (data) => {
   const [restaurant] = await db.insert(restaurants).values(data).returning();
   return restaurant;
@@ -130,4 +187,12 @@ const deleteRestaurant = async (id) => {
   if (!deleted) throw new AppError('Restaurant not found', 404);
 };
 
-module.exports = { getRestaurants, getRestaurantById, getMenu, createRestaurant, updateRestaurant, deleteRestaurant };
+module.exports = {
+  getRestaurants,
+  getRestaurantById,
+  getMenu,
+  getOwnerMenu,
+  createRestaurant,
+  updateRestaurant,
+  deleteRestaurant,
+};

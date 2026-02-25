@@ -15,25 +15,15 @@ const SELF_ASSIGNABLE_ROLES = ['user', 'restaurant_owner'];
 
 // ─── Internal guards ──────────────────────────────────────────────────────────
 
-/**
- * Hard-block any attempt to self-assign the admin role.
- * This runs BEFORE any DB access, so it is the first line of defence
- * regardless of what the Zod schema allows.
- */
 const _rejectAdminRole = (role) => {
   if (role === 'admin') {
     throw new AppError(
-      'The "admin" role cannot be self-assigned. ' +
-      'Contact a system administrator.',
+      'The "admin" role cannot be self-assigned. Contact a system administrator.',
       400
     );
   }
 };
 
-/**
- * Validate that a role is self-assignable.
- * Called only when creating a new user, as a final safety net before the INSERT.
- */
 const _validateSelfAssignableRole = (role) => {
   if (!SELF_ASSIGNABLE_ROLES.includes(role)) {
     throw new AppError(
@@ -43,23 +33,39 @@ const _validateSelfAssignableRole = (role) => {
   }
 };
 
+// ─── checkPhoneExists (Issue #4) ──────────────────────────────────────────────
+
+/**
+ * checkPhoneExists(phone)
+ *
+ * Called by the login screen BEFORE sending OTP.
+ * Returns { exists: boolean } so the frontend can route the user correctly:
+ *   - exists: true  → proceed to OTP screen (login flow)
+ *   - exists: false → redirect to Register screen (registration flow)
+ *
+ * Does NOT send an OTP. Does NOT create any records. Pure read.
+ */
+const checkPhoneExists = async (phone) => {
+  logger.debug('checkPhoneExists', { phone: phone.slice(0, 6) + '****' }); // #9
+
+  const [user] = await db
+    .select({ id: users.id, role: users.role })
+    .from(users)
+    .where(eq(users.phone, phone))
+    .limit(1);
+
+  return { exists: !!user };
+};
+
 // ─── sendOtp ──────────────────────────────────────────────────────────────────
 
 /**
  * sendOtp(phone, requestedRole?)
  *
- * Sends a one-time password. The role is accepted here purely for UX — some
- * clients send it at this step. The backend does NOT store the role in the OTP
- * record (schema has no role column). The client must re-send the role with
- * verify-otp. This is safe: the service validates it again on every call.
- *
- * Security:
- *  - "admin" is rejected immediately.
- *  - Role is only applied when creating a NEW account in verifyOtp.
- *  - Existing accounts are never affected by this value.
+ * Sends an OTP. Role accepted for UX flow — applied only if creating new account.
+ * Security: "admin" rejected immediately. Role only applied in verifyOtp for new users.
  */
 const sendOtp = async (phone, requestedRole) => {
-  // Guard 1: reject admin immediately
   if (requestedRole) {
     _rejectAdminRole(requestedRole);
   }
@@ -86,44 +92,22 @@ const sendOtp = async (phone, requestedRole) => {
 /**
  * verifyOtp(phone, otp, requestedRole?)
  *
- * Verifies the OTP and returns an auth response.
- *
  * Account logic:
- *
- *  ┌─ User EXISTS ────────────────────────────────────────────────────────────┐
- *  │  • Use stored role — ALWAYS. requestedRole is ignored.                   │
- *  │  • This prevents role escalation for any existing account.               │
- *  └──────────────────────────────────────────────────────────────────────────┘
- *
- *  ┌─ User does NOT EXIST ────────────────────────────────────────────────────┐
- *  │  • Resolve role:                                                         │
- *  │      requestedRole === 'restaurant_owner' → 'restaurant_owner'           │
- *  │      anything else (or omitted)           → 'user'  (safe default)       │
- *  │  • Validate against SELF_ASSIGNABLE_ROLES before INSERT.                 │
- *  │  • Create user with resolved role.                                       │
- *  └──────────────────────────────────────────────────────────────────────────┘
- *
- *  In both paths "admin" is blocked before any DB access.
+ *  - User EXISTS: stored role used always. requestedRole ignored.
+ *  - User NOT EXIST: roleToAssign = requestedRole === 'restaurant_owner'
+ *                    ? 'restaurant_owner' : 'user'
  */
 const verifyOtp = async (phone, otp, requestedRole) => {
-  // Guard 1: reject admin immediately, before any DB work
   if (requestedRole) {
     _rejectAdminRole(requestedRole);
   }
 
   const now = new Date();
 
-  // Fetch the latest valid, unused OTP for this phone
   const [record] = await db
     .select()
     .from(otps)
-    .where(
-      and(
-        eq(otps.phone, phone),
-        eq(otps.used, false),
-        gt(otps.expiresAt, now)
-      )
-    )
+    .where(and(eq(otps.phone, phone), eq(otps.used, false), gt(otps.expiresAt, now)))
     .orderBy(desc(otps.createdAt))
     .limit(1);
 
@@ -131,7 +115,6 @@ const verifyOtp = async (phone, otp, requestedRole) => {
     throw new AppError('OTP expired or not found. Please request a new one.', 400);
   }
 
-  // Verify the supplied OTP against the stored hash
   const isValid = await verifyOTP(otp, record.otpHash);
   if (!isValid) {
     const newAttempts = record.attempts + 1;
@@ -140,26 +123,16 @@ const verifyOtp = async (phone, otp, requestedRole) => {
       .set({ attempts: newAttempts })
       .where(eq(otps.id, record.id));
 
-    // Lock the OTP after 5 failed attempts
     if (newAttempts >= 5) {
-      await db.update(otps)
-        .set({ used: true })
-        .where(eq(otps.id, record.id));
-      throw new AppError(
-        'Too many incorrect attempts. Please request a new OTP.',
-        400
-      );
+      await db.update(otps).set({ used: true }).where(eq(otps.id, record.id));
+      throw new AppError('Too many incorrect attempts. Please request a new OTP.', 400);
     }
 
     throw new AppError(`Invalid OTP. ${5 - newAttempts} attempt(s) remaining.`, 400);
   }
 
-  // Mark OTP consumed immediately to prevent replay attacks
-  await db.update(otps)
-    .set({ used: true })
-    .where(eq(otps.id, record.id));
+  await db.update(otps).set({ used: true }).where(eq(otps.id, record.id));
 
-  // ── Resolve user ───────────────────────────────────────────────────────────
   const [existingUser] = await db
     .select()
     .from(users)
@@ -170,8 +143,6 @@ const verifyOtp = async (phone, otp, requestedRole) => {
   let isNewUser;
 
   if (existingUser) {
-    // ── Path A: existing account ────────────────────────────────────────────
-    // Stored role wins unconditionally. requestedRole is thrown away.
     if (requestedRole && requestedRole !== existingUser.role) {
       logger.warn('Role change attempt on existing account — ignored', {
         userId: existingUser.id,
@@ -183,17 +154,9 @@ const verifyOtp = async (phone, otp, requestedRole) => {
     isNewUser = false;
 
   } else {
-    // ── Path B: new account ─────────────────────────────────────────────────
-    //
-    // Resolve role with an explicit, readable conditional — exactly as the
-    // spec describes:
-    //   requestedRole === 'restaurant_owner'  →  'restaurant_owner'
-    //   anything else (undefined / 'user')    →  'user'
-    //
     const roleToAssign =
       requestedRole === 'restaurant_owner' ? 'restaurant_owner' : 'user';
 
-    // Guard 2: final validation before INSERT (defence-in-depth)
     _validateSelfAssignableRole(roleToAssign);
 
     [user] = await db
@@ -201,14 +164,10 @@ const verifyOtp = async (phone, otp, requestedRole) => {
       .values({ phone, role: roleToAssign })
       .returning();
 
-    logger.info('New user registered via OTP', {
-      userId: user.id,
-      role: user.role,
-    });
+    logger.info('New user registered via OTP', { userId: user.id, role: user.role });
     isNewUser = true;
   }
 
-  // Issue tokens and return response
   const tokens = await _issueTokens(user);
 
   return {
@@ -248,7 +207,6 @@ const googleLogin = async (idToken) => {
         .returning();
     }
   } else {
-    // Google sign-in always creates a "user" role account
     [user] = await db.insert(users)
       .values({ googleId, email, name, avatar: picture, role: 'user' })
       .returning();
@@ -298,7 +256,7 @@ const logout = async (token) => {
 
 const _issueTokens = async (user) => {
   const tokens = generateTokenPair(user);
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
   await db.insert(refreshTokens).values({
     userId: user.id,
@@ -319,6 +277,7 @@ const _safeUser = (user) => ({
 });
 
 module.exports = {
+  checkPhoneExists,
   sendOtp,
   verifyOtp,
   googleLogin,

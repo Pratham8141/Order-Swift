@@ -1,14 +1,32 @@
+/**
+ * src/controllers/auth.controller.js
+ *
+ * Issue #4: Added checkPhone controller.
+ * The frontend calls POST /auth/check-phone BEFORE sending OTP.
+ * Response: { exists: boolean }
+ *   true  → user exists → login flow → send OTP → OTP screen
+ *   false → new user → navigate to Register screen
+ */
 const authService = require('../services/auth.service');
 const { sendSuccess, asyncHandler } = require('../utils/response');
 
 /**
+ * POST /api/v1/auth/check-phone
+ * Body: { phone: string }
+ * Response: { exists: boolean }
+ *
+ * Pure check — no OTP sent, no records created.
+ * Used by login screen to decide: login flow vs register flow.
+ */
+const checkPhone = asyncHandler(async (req, res) => {
+  const { phone } = req.body;
+  const result = await authService.checkPhoneExists(phone);
+  sendSuccess(res, result, 'Phone check complete');
+});
+
+/**
  * POST /api/v1/auth/send-otp
- *
- * Body:
- *   { phone: string, role?: "user" | "restaurant_owner" }
- *
- * role is optional. When provided it is used as a hint for new account creation
- * inside verifyOtp. It has no effect on existing accounts.
+ * Body: { phone, role? }
  */
 const sendOtp = asyncHandler(async (req, res) => {
   const { phone, role } = req.body;
@@ -18,18 +36,11 @@ const sendOtp = asyncHandler(async (req, res) => {
 
 /**
  * POST /api/v1/auth/verify-otp
+ * Body: { phone, otp, role? }
  *
- * Body:
- *   { phone: string, otp: string, role?: "user" | "restaurant_owner" }
- *
- * role is passed to the service which decides whether to use it:
- *   - New account  → role used to set initial user role (defaults to "user")
- *   - Existing     → role ignored, stored role returned
- *   - "admin"      → rejected with 400 by the service
- *
- * Response shape (unchanged):
- *   { success: true, message: string,
- *     data: { user, accessToken, refreshToken, isNewUser } }
+ * role: only applied for NEW account creation.
+ * Existing accounts always use stored role.
+ * "admin" is always rejected.
  */
 const verifyOtp = asyncHandler(async (req, res) => {
   const { phone, otp, role } = req.body;
@@ -55,4 +66,4 @@ const logout = asyncHandler(async (req, res) => {
   sendSuccess(res, {}, 'Logged out successfully');
 });
 
-module.exports = { sendOtp, verifyOtp, googleLogin, refreshToken, logout };
+module.exports = { checkPhone, sendOtp, verifyOtp, googleLogin, refreshToken, logout };
