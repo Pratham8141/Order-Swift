@@ -18,11 +18,13 @@ const connectionString = isProduction
 
 const pool = new Pool({
   connectionString,
-  ssl: { rejectUnauthorized: isProduction }, // strict SSL in prod, relaxed in dev
+  ssl: {
+    rejectUnauthorized: false,   // ALWAYS false for Supabase on Render
+  },
   max: 20,
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 10_000,
-  statement_timeout: 30_000, // kill runaway queries after 30s
+  statement_timeout: 30_000,
 });
 
 pool.on('error', (err) => {
