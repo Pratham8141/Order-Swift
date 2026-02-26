@@ -144,6 +144,12 @@ const removeCartSchema = z.object({
 const createOrderSchema = z.object({
   notes:      z.string().max(500).optional(),
   pickupName: z.string().max(100).optional(),
+  // FIX: useWallet and couponCode were missing — Zod strips unknown keys by
+  // default (schema.strict() or passthrough() not set), so these fields were
+  // silently removed before reaching orderService.createOrder(). The wallet
+  // was never debited and coupons were never applied even when sent by client.
+  useWallet:  z.boolean().optional().default(false),
+  couponCode: z.string().max(50).trim().toUpperCase().optional(),
 });
 
 const orderStatusSchema = z.object({

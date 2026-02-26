@@ -207,6 +207,11 @@ const orders = pgTable('orders', {
   discountAmount:   decimal('discount_amount', { precision: 10, scale: 2 }).default('0.00'),
   totalAmount:      decimal('total_amount',    { precision: 10, scale: 2 }).notNull(),
   couponCode:       varchar('coupon_code',     { length: 50 }),
+  // FIX: wallet_amount_used was added via migration 005 but was missing from
+  // this Drizzle schema definition. Without it, Drizzle's getOrderById() call
+  // would fail with a column mapping error → 500 Internal Server Error.
+  // The column exists in the DB (added by ALTER TABLE in 005_wallet_coupons.sql).
+  walletAmountUsed: decimal('wallet_amount_used', { precision: 10, scale: 2 }).default('0.00'),
   pickupName:       varchar('pickup_name',     { length: 100 }),
   notes:            text('notes'),
   preparationTime:  integer('preparation_time'),

@@ -28,7 +28,7 @@ app.use(cors({
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Idempotency-Key'], // FIX: X-Idempotency-Key was missing — CORS preflight stripped it, making idempotency silently fail
 }));
 
 // ─── Render / proxy trust (required for rate limiting on Render) ──────────────
