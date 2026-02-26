@@ -14,6 +14,8 @@ const {
 const { eq, and, desc, inArray } = require('drizzle-orm');
 const { AppError }   = require('../utils/response');
 const cartService    = require('./cart.service');
+const walletService  = require('./wallet.service');
+const couponService  = require('./coupon.service');
 const logger         = require('../utils/logger');
 
 // ─── Takeaway-only state machine ──────────────────────────────────────────────
@@ -31,14 +33,25 @@ const STATE_TRANSITIONS = {
 // ─── createOrder (ATOMIC TRANSACTION) ────────────────────────────────────────
 /**
  * Creates a takeaway order.
- *
- * Removed: addressId requirement, address validation, deliveryFee, taxAmount.
- * Added:   pickupName (optional), couponCode (reserved for future use).
+ * Supports: idempotency key, wallet payment, coupon code.
  *
  * @param {string} userId
- * @param {{ notes?: string, pickupName?: string }} body
+ * @param {{ notes?, pickupName?, idempotencyKey?, useWallet?, couponCode? }} body
  */
-const createOrder = async (userId, { notes, pickupName } = {}) => {
+const createOrder = async (userId, {
+  notes, pickupName, idempotencyKey,
+  useWallet = false, couponCode,
+} = {}) => {
+  // Idempotency check
+  if (idempotencyKey) {
+    const [existing] = await db.select()
+      .from(orders)
+      .where(and(eq(orders.userId, userId), eq(orders.idempotencyKey, idempotencyKey)))
+      .limit(1);
+    if (existing) {
+      return getOrderById(existing.id, userId);
+    }
+  }
   // 1. Fetch cart — server calculates all prices, never trusts frontend
   const { cart, items, pricing } = await cartService.getCart(userId);
   if (!cart || !items.length) throw new AppError('Your cart is empty', 400);
@@ -57,6 +70,27 @@ const createOrder = async (userId, { notes, pickupName } = {}) => {
       `Minimum order is ₹${minOrder.toFixed(2)}. Your subtotal is ₹${pricing.subtotal.toFixed(2)}.`,
       400
     );
+  }
+
+  // 3b. Coupon validation (if provided)
+  let couponData = null;
+  let couponDiscountAmount = 0;
+  if (couponCode) {
+    couponData = await couponService.validateCoupon(couponCode, userId, pricing.subtotal);
+    couponDiscountAmount = couponData.discountAmount;
+  }
+
+  // Final pricing
+  const totalDiscountAmount = pricing.discountAmount + couponDiscountAmount;
+  const finalTotal = Math.max(0, pricing.subtotal - totalDiscountAmount);
+
+  // 3c. Wallet balance check (if requested)
+  let walletDebitAmount = 0;
+  if (useWallet) {
+    const wallet = await walletService.getOrCreateWallet(userId);
+    const walletBalance = parseFloat(wallet.balance);
+    walletDebitAmount = Math.min(walletBalance, finalTotal);
+    if (walletDebitAmount < 0) walletDebitAmount = 0;
   }
 
   // 4. Build order-item snapshots from DB (price at time of order, immutable)
@@ -87,26 +121,35 @@ const createOrder = async (userId, { notes, pickupName } = {}) => {
          user_id, restaurant_id,
          status, payment_status,
          subtotal, discount_amount, total_amount,
+         coupon_code,
          pickup_name, notes,
          preparation_time,
+         idempotency_key,
+         wallet_amount_used,
          created_at, updated_at
        ) VALUES (
          $1, $2,
          'pending', 'pending',
          $3, $4, $5,
-         $6, $7,
-         $8,
+         $6,
+         $7, $8,
+         $9,
+         $10,
+         $11,
          NOW(), NOW()
        ) RETURNING *`,
       [
         userId,
         cart.restaurantId,
         pricing.subtotal.toFixed(2),
-        pricing.discountAmount.toFixed(2),
-        pricing.totalAmount.toFixed(2),
-        pickupName  ?? null,
-        notes       ?? null,
+        totalDiscountAmount.toFixed(2),
+        finalTotal.toFixed(2),
+        couponCode   ?? null,
+        pickupName   ?? null,
+        notes        ?? null,
         restaurant.preparationTime ?? 20,
+        idempotencyKey ?? null,
+        walletDebitAmount.toFixed(2),
       ]
     );
 
@@ -139,9 +182,27 @@ const createOrder = async (userId, { notes, pickupName } = {}) => {
     logger.info('Order created', {
       orderId: order.id,
       userId,
-      total: pricing.totalAmount,
+      total: finalTotal,
+      walletUsed: walletDebitAmount,
+      coupon: couponCode ?? null,
       restaurantId: cart.restaurantId,
     });
+
+    createdOrderId = order.id;
+
+    // Post-commit side-effects (non-blocking)
+    // Debit wallet if used
+    if (walletDebitAmount > 0) {
+      walletService.debitWallet(
+        userId, walletDebitAmount, order.id, 'Order payment'
+      ).catch(err => logger.error('Wallet debit failed post-commit', { error: err.message, orderId: order.id }));
+    }
+
+    // Record coupon usage
+    if (couponData) {
+      couponService.recordCouponUsage(couponData.coupon.id, userId, order.id)
+        .catch(err => logger.error('Coupon usage record failed', { error: err.message }));
+    }
 
   } catch (err) {
     await client.query('ROLLBACK');

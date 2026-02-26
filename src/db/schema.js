@@ -31,7 +31,18 @@ const users = pgTable('users', {
   googleIdx: uniqueIndex('users_google_idx').on(t.googleId),
 }));
 
-// ─── OTPs ─────────────────────────────────────────────────────────────────────
+// ─── User Roles (scalable multi-role support) ─────────────────────────────────
+// Allows a user to have multiple roles (e.g., both 'user' and 'restaurant_owner').
+// The 'role' on the users table is the PRIMARY role for backward compatibility.
+const userRoles = pgTable('user_roles', {
+  id:        uuid('id').primaryKey().defaultRandom(),
+  userId:    uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  role:      userRoleEnum('role').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (t) => ({
+  uniqueUserRole: uniqueIndex('user_roles_user_role_idx').on(t.userId, t.role),
+  userIdx:        index('user_roles_user_idx').on(t.userId),
+}));
 const otps = pgTable('otps', {
   id:        uuid('id').primaryKey().defaultRandom(),
   phone:     varchar('phone', { length: 20 }).notNull(),
@@ -199,6 +210,7 @@ const orders = pgTable('orders', {
   pickupName:       varchar('pickup_name',     { length: 100 }),
   notes:            text('notes'),
   preparationTime:  integer('preparation_time'),
+  idempotencyKey:   varchar('idempotency_key', { length: 100 }),
   createdAt:        timestamp('created_at').defaultNow().notNull(),
   updatedAt:        timestamp('updated_at').defaultNow().notNull(),
 }, (t) => ({
@@ -206,6 +218,7 @@ const orders = pgTable('orders', {
   restaurantIdx:  index('orders_restaurant_idx').on(t.restaurantId),
   statusIdx:      index('orders_status_idx').on(t.status),
   razorpayOrdIdx: uniqueIndex('orders_razorpay_order_idx').on(t.razorpayOrderId),
+  idempotencyIdx: uniqueIndex('orders_idempotency_idx').on(t.userId, t.idempotencyKey),
 }));
 
 const orderItems = pgTable('order_items', {
@@ -262,13 +275,74 @@ const notifications = pgTable('notifications', {
   userIdx: index('notifications_user_idx').on(t.userId),
 }));
 
+// ─── Wallet ───────────────────────────────────────────────────────────────────
+const wallets = pgTable('wallets', {
+  id:        uuid('id').primaryKey().defaultRandom(),
+  userId:    uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  balance:   decimal('balance', { precision: 12, scale: 2 }).default('0.00').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+  updatedAt: timestamp('updated_at').defaultNow().notNull(),
+}, (t) => ({
+  userIdx: uniqueIndex('wallets_user_idx').on(t.userId),
+}));
+
+const transactionTypeEnum = pgEnum('transaction_type', ['credit', 'debit']);
+
+const walletTransactions = pgTable('wallet_transactions', {
+  id:          uuid('id').primaryKey().defaultRandom(),
+  userId:      uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  type:        transactionTypeEnum('type').notNull(),
+  amount:      decimal('amount', { precision: 10, scale: 2 }).notNull(),
+  description: varchar('description', { length: 255 }).notNull(),
+  referenceId: uuid('reference_id'),   // orderId for debit/refund transactions
+  balanceAfter: decimal('balance_after', { precision: 12, scale: 2 }).notNull(),
+  createdAt:   timestamp('created_at').defaultNow().notNull(),
+}, (t) => ({
+  userIdx:    index('wallet_tx_user_idx').on(t.userId),
+  refIdx:     index('wallet_tx_ref_idx').on(t.referenceId),
+}));
+
+// ─── Coupons ──────────────────────────────────────────────────────────────────
+const couponTypeEnum = pgEnum('coupon_type', ['flat', 'percentage']);
+
+const coupons = pgTable('coupons', {
+  id:            uuid('id').primaryKey().defaultRandom(),
+  code:          varchar('code', { length: 50 }).notNull(),
+  type:          couponTypeEnum('type').notNull(),
+  value:         decimal('value', { precision: 8, scale: 2 }).notNull(),
+  minOrder:      decimal('min_order', { precision: 8, scale: 2 }).default('0.00'),
+  maxDiscount:   decimal('max_discount', { precision: 8, scale: 2 }),
+  expiresAt:     timestamp('expires_at'),
+  usageLimit:    integer('usage_limit'),
+  usedCount:     integer('used_count').default(0).notNull(),
+  perUserLimit:  integer('per_user_limit').default(1).notNull(),
+  isActive:      boolean('is_active').default(true).notNull(),
+  createdAt:     timestamp('created_at').defaultNow().notNull(),
+  updatedAt:     timestamp('updated_at').defaultNow().notNull(),
+}, (t) => ({
+  codeIdx: uniqueIndex('coupons_code_idx').on(t.code),
+}));
+
+const couponUsage = pgTable('coupon_usage', {
+  id:        uuid('id').primaryKey().defaultRandom(),
+  userId:    uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  couponId:  uuid('coupon_id').references(() => coupons.id, { onDelete: 'cascade' }).notNull(),
+  orderId:   uuid('order_id').references(() => orders.id, { onDelete: 'set null' }),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+}, (t) => ({
+  userCouponIdx: index('coupon_usage_user_coupon_idx').on(t.userId, t.couponId),
+}));
+
 module.exports = {
-  users, otps, refreshTokens, addresses,
+  users, userRoles, otps, refreshTokens, addresses,
   restaurants, categories, menuItems, menuItemVariants, addOns,
   carts, cartItems,
   orders, orderItems,
   reviews,
   favorites,
   notifications,
+  wallets, walletTransactions,
+  coupons, couponUsage,
   userRoleEnum, orderStatusEnum, paymentStatusEnum, notifTypeEnum,
+  transactionTypeEnum, couponTypeEnum,
 };

@@ -32,6 +32,8 @@ const verifyOtpSchema = z.object({
   otp:   z.string().length(6).regex(/^\d+$/, 'OTP must be exactly 6 digits'),
   // role: only applied when creating a brand-new account.
   role:  optionalRoleField,
+  // name: optional, stored only for new accounts
+  name:  z.string().min(1).max(100).optional(),
 });
 
 const googleAuthSchema = z.object({

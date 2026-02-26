@@ -68,6 +68,8 @@ app.use(`${API}/orders`,      require('./routes/order.routes'));
 app.use(`${API}/payments`,    require('./routes/payment.routes'));
 app.use(`${API}/reviews`,     require('./routes/review.routes'));
 app.use(`${API}/admin`,       require('./routes/admin.routes'));
+app.use(`${API}/wallet`,      require('./routes/wallet.routes'));
+app.use(`${API}/coupons`,     require('./routes/coupon.routes'));
 
 // ─── Restaurant Owner Routes (NEW) ────────────────────────────────────────────
 app.use(`${API}/owner`,       require('./routes/restaurantOwner.routes'));

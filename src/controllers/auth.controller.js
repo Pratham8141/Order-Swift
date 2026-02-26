@@ -43,8 +43,8 @@ const sendOtp = asyncHandler(async (req, res) => {
  * "admin" is always rejected.
  */
 const verifyOtp = asyncHandler(async (req, res) => {
-  const { phone, otp, role } = req.body;
-  const result = await authService.verifyOtp(phone, otp, role);
+  const { phone, otp, role, name } = req.body;
+  const result = await authService.verifyOtp(phone, otp, role, name);
   sendSuccess(res, result, 'Login successful');
 });
 
@@ -66,4 +66,42 @@ const logout = asyncHandler(async (req, res) => {
   sendSuccess(res, {}, 'Logged out successfully');
 });
 
-module.exports = { checkPhone, sendOtp, verifyOtp, googleLogin, refreshToken, logout };
+
+// Role management is appended below
+
+// ─── Role Management ──────────────────────────────────────────────────────────
+
+/**
+ * GET /api/v1/auth/roles
+ * Returns all roles the user has (from user_roles table).
+ */
+const getUserRoles = asyncHandler(async (req, res) => {
+  const result = await authService.getUserRoles(req.user.id);
+  sendSuccess(res, result, 'User roles fetched');
+});
+
+/**
+ * POST /api/v1/auth/roles/add
+ * Body: { role: "user" | "restaurant_owner" }
+ * Adds a new role to the user without removing the existing one.
+ * This enables a restaurant owner to also order as a customer, and vice versa.
+ */
+const addUserRole = asyncHandler(async (req, res) => {
+  const { role } = req.body;
+  const result = await authService.addUserRole(req.user.id, role);
+  sendSuccess(res, result, `Role '${role}' added`);
+});
+
+/**
+ * POST /api/v1/auth/roles/switch
+ * Body: { role: "user" | "restaurant_owner" }
+ * Switches the primary role (updates users.role) — issues new tokens with new role.
+ * User must already have this role in user_roles table.
+ */
+const switchPrimaryRole = asyncHandler(async (req, res) => {
+  const { role } = req.body;
+  const result = await authService.switchPrimaryRole(req.user.id, role);
+  sendSuccess(res, result, `Switched to role '${role}'`);
+});
+
+module.exports = { checkPhone, sendOtp, verifyOtp, googleLogin, refreshToken, logout, getUserRoles, addUserRole, switchPrimaryRole };

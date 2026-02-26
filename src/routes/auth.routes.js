@@ -21,3 +21,8 @@ router.post('/refresh',                 validate(schemas.refreshToken), ctrl.ref
 router.post('/logout',     protect,                                    ctrl.logout);
 
 module.exports = router;
+
+// Role management (authenticated)
+router.get('/roles',         protect, ctrl.getUserRoles);
+router.post('/roles/add',    protect, ctrl.addUserRole);
+router.post('/roles/switch', protect, ctrl.switchPrimaryRole);

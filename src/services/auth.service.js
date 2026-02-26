@@ -1,5 +1,5 @@
 const { db } = require('../db');
-const { users, otps, refreshTokens } = require('../db/schema');
+const { users, otps, refreshTokens, userRoles } = require('../db/schema');
 const { eq, and, gt, desc } = require('drizzle-orm');
 const { generateOTP, hashOTP, verifyOTP } = require('../utils/otp');
 const { generateTokenPair } = require('../utils/jwt');
@@ -97,7 +97,7 @@ const sendOtp = async (phone, requestedRole) => {
  *  - User NOT EXIST: roleToAssign = requestedRole === 'restaurant_owner'
  *                    ? 'restaurant_owner' : 'user'
  */
-const verifyOtp = async (phone, otp, requestedRole) => {
+const verifyOtp = async (phone, otp, requestedRole, name) => {
   if (requestedRole) {
     _rejectAdminRole(requestedRole);
   }
@@ -150,7 +150,16 @@ const verifyOtp = async (phone, otp, requestedRole) => {
         requestedRole,
       });
     }
-    user = existingUser;
+    // Update name if it's not set yet and user provided one during this login
+    if (name?.trim() && !existingUser.name) {
+      const [updated] = await db.update(users)
+        .set({ name: name.trim(), updatedAt: new Date() })
+        .where(eq(users.id, existingUser.id))
+        .returning();
+      user = updated;
+    } else {
+      user = existingUser;
+    }
     isNewUser = false;
 
   } else {
@@ -161,7 +170,7 @@ const verifyOtp = async (phone, otp, requestedRole) => {
 
     [user] = await db
       .insert(users)
-      .values({ phone, role: roleToAssign })
+      .values({ phone, role: roleToAssign, name: name?.trim() || null })
       .returning();
 
     logger.info('New user registered via OTP', { userId: user.id, role: user.role });
@@ -169,6 +178,9 @@ const verifyOtp = async (phone, otp, requestedRole) => {
   }
 
   const tokens = await _issueTokens(user);
+
+  // Sync user_roles table to keep it consistent with users.role
+  await _syncUserRoles(user.id, user.role);
 
   return {
     user: _safeUser(user),
@@ -276,6 +288,88 @@ const _safeUser = (user) => ({
   role:   user.role,
 });
 
+// ─── Role Management ──────────────────────────────────────────────────────────
+
+/**
+ * Syncs user_roles table whenever we create/verify an account.
+ * Ensures the primary role always has a matching entry in user_roles.
+ */
+const _syncUserRoles = async (userId, role) => {
+  try {
+    await db.insert(userRoles)
+      .values({ userId, role })
+      .onConflictDoNothing();
+  } catch {
+    // Non-critical — log and continue
+    logger.warn('_syncUserRoles failed', { userId, role });
+  }
+};
+
+/**
+ * getUserRoles(userId)
+ * Returns all roles the user holds.
+ */
+const getUserRoles = async (userId) => {
+  const rows = await db.select({ role: userRoles.role })
+    .from(userRoles)
+    .where(eq(userRoles.userId, userId));
+  return { roles: rows.map(r => r.role) };
+};
+
+/**
+ * addUserRole(userId, role)
+ * Grants a new role to the user without removing existing ones.
+ * Use case: a normal user wants to also become a restaurant owner.
+ */
+const addUserRole = async (userId, role) => {
+  _rejectAdminRole(role);
+  _validateSelfAssignableRole(role);
+
+  await db.insert(userRoles)
+    .values({ userId, role })
+    .onConflictDoNothing();
+
+  logger.info('Role added to user', { userId, role });
+  return getUserRoles(userId);
+};
+
+/**
+ * switchPrimaryRole(userId, role)
+ * Switches the user's primary role. User must already have this role in user_roles.
+ * Issues new tokens reflecting the new role.
+ * Use case: restaurant owner wants to switch to ordering as a customer.
+ */
+const switchPrimaryRole = async (userId, role) => {
+  _rejectAdminRole(role);
+  _validateSelfAssignableRole(role);
+
+  // User must already have this role
+  const [existing] = await db.select({ id: userRoles.id })
+    .from(userRoles)
+    .where(and(eq(userRoles.userId, userId), eq(userRoles.role, role)))
+    .limit(1);
+
+  if (!existing) {
+    throw new AppError(
+      `You don't have the '${role}' role. Use POST /auth/roles/add first.`,
+      403
+    );
+  }
+
+  const [user] = await db.update(users)
+    .set({ role, updatedAt: new Date() })
+    .where(eq(users.id, userId))
+    .returning();
+
+  if (!user) throw new AppError('User not found', 404);
+
+  // Issue new tokens with updated role
+  const tokens = await _issueTokens(user);
+  logger.info('User switched primary role', { userId, newRole: role });
+
+  return { user: _safeUser(user), ...tokens };
+};
+
 module.exports = {
   checkPhoneExists,
   sendOtp,
@@ -283,4 +377,7 @@ module.exports = {
   googleLogin,
   refreshAccessToken,
   logout,
+  getUserRoles,
+  addUserRole,
+  switchPrimaryRole,
 };
