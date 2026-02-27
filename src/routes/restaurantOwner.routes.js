@@ -419,4 +419,55 @@ router.patch('/order/:id/status', asyncHandler(async (req, res) => {
   return sendSuccess(res, updated, `Order status updated to '${newStatus}'`);
 }));
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// TERMS & CONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * GET /api/v1/owner/terms-status
+ * Returns whether the current owner has accepted the platform T&C.
+ */
+router.get('/terms-status', asyncHandler(async (req, res) => {
+  const restaurant = await getOwnedRestaurant(req.user.id).catch(() => null);
+  return sendSuccess(res, {
+    accepted:   !!restaurant?.termsAcceptedAt,
+    acceptedAt: restaurant?.termsAcceptedAt ?? null,
+  });
+}));
+
+/**
+ * POST /api/v1/owner/terms-accept
+ * Records T&C acceptance for the owner's restaurant.
+ * Body: { accepted: true } — must be explicitly true.
+ */
+router.post('/terms-accept', asyncHandler(async (req, res) => {
+  if (req.body.accepted !== true) {
+    throw new AppError('You must explicitly accept the Terms & Conditions (accepted: true)', 400);
+  }
+
+  const restaurant = await getOwnedRestaurant(req.user.id);
+
+  if (restaurant.termsAcceptedAt) {
+    // Already accepted — idempotent, no error
+    return sendSuccess(res, {
+      accepted:   true,
+      acceptedAt: restaurant.termsAcceptedAt,
+    }, 'Terms already accepted');
+  }
+
+  const [updated] = await db
+    .update(restaurants)
+    .set({ termsAcceptedAt: new Date(), updatedAt: new Date() })
+    .where(eq(restaurants.id, restaurant.id))
+    .returning();
+
+  logger.info('Terms accepted', { ownerId: req.user.id, restaurantId: restaurant.id });
+
+  return sendSuccess(res, {
+    accepted:   true,
+    acceptedAt: updated.termsAcceptedAt,
+  }, 'Terms & Conditions accepted');
+}));
+
+
 module.exports = router;

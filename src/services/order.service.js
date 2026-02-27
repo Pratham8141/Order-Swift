@@ -1,11 +1,26 @@
 /**
  * src/services/order.service.js
  *
- * TAKEAWAY-ONLY — no address validation, no delivery fee, no tax.
- * Pricing: totalAmount = subtotal - discountAmount
- * preparationTime replaces estimatedTime throughout.
+ * FIXES IN THIS VERSION:
+ * ─────────────────────────────────────────────────────────────────────────────
+ * FIX 1 — getOrders now returns restaurant name + order items:
+ *   Previously returned only order rows with no joins. Frontend showed only
+ *   "Order ID". Now performs:
+ *     1. Fetch orders (with restaurantId)
+ *     2. Batch-fetch restaurant names (no N+1 — single IN query)
+ *     3. Batch-fetch order items for all returned orders (single IN query)
+ *   Total: 3 queries for any page size vs N+2 before.
  *
- * All DB writes in createOrder are wrapped in a single Postgres transaction.
+ * FIX 2 — reorderFromPastOrder added:
+ *   Validates each order item's menu item is still available, adds all valid
+ *   items to cart, returns a summary of what was added and what was skipped.
+ *
+ * ARCHITECTURAL NOTE — Drizzle join vs batch approach:
+ *   We deliberately avoid a single complex JOIN for getOrders because:
+ *   - Drizzle's select() with joined tables requires column aliasing to avoid
+ *     name collisions (e.g. orders.id vs restaurants.id vs order_items.id).
+ *   - The batch approach (3 queries) is equivalent performance for page sizes
+ *     up to ~50, cleaner to read, and easier to paginate correctly.
  */
 const { db, pool }   = require('../db');
 const {
@@ -19,7 +34,6 @@ const couponService  = require('./coupon.service');
 const logger         = require('../utils/logger');
 
 // ─── Takeaway-only state machine ──────────────────────────────────────────────
-// Removed: out_for_delivery, delivered — replaced with ready + collected
 const STATE_TRANSITIONS = {
   pending:   ['paid',      'cancelled'],
   paid:      ['confirmed', 'cancelled'],
@@ -31,13 +45,6 @@ const STATE_TRANSITIONS = {
 };
 
 // ─── createOrder (ATOMIC TRANSACTION) ────────────────────────────────────────
-/**
- * Creates a takeaway order.
- * Supports: idempotency key, wallet payment, coupon code.
- *
- * @param {string} userId
- * @param {{ notes?, pickupName?, idempotencyKey?, useWallet?, couponCode? }} body
- */
 const createOrder = async (userId, {
   notes, pickupName, idempotencyKey,
   useWallet = false, couponCode,
@@ -52,18 +59,15 @@ const createOrder = async (userId, {
       return getOrderById(existing.id, userId);
     }
   }
-  // 1. Fetch cart — server calculates all prices, never trusts frontend
+
   const { cart, items, pricing } = await cartService.getCart(userId);
   if (!cart || !items.length) throw new AppError('Your cart is empty', 400);
 
-  // 2. Validate restaurant is active
   const [restaurant] = await db.select().from(restaurants)
-    .where(eq(restaurants.id, cart.restaurantId))
-    .limit(1);
-  if (!restaurant)        throw new AppError('Restaurant not found', 404);
+    .where(eq(restaurants.id, cart.restaurantId)).limit(1);
+  if (!restaurant)          throw new AppError('Restaurant not found', 404);
   if (!restaurant.isActive) throw new AppError('This restaurant is currently closed', 400);
 
-  // 3. Minimum order check
   const minOrder = parseFloat(restaurant.minOrder || 0);
   if (pricing.subtotal < minOrder) {
     throw new AppError(
@@ -72,7 +76,6 @@ const createOrder = async (userId, {
     );
   }
 
-  // 3b. Coupon validation (if provided)
   let couponData = null;
   let couponDiscountAmount = 0;
   if (couponCode) {
@@ -80,23 +83,17 @@ const createOrder = async (userId, {
     couponDiscountAmount = couponData.discountAmount;
   }
 
-  // Final pricing
   const totalDiscountAmount = pricing.discountAmount + couponDiscountAmount;
   const finalTotal = Math.max(0, pricing.subtotal - totalDiscountAmount);
 
-  // 3c. Wallet balance check (if requested)
   let walletDebitAmount = 0;
   if (useWallet) {
     const wallet = await walletService.getOrCreateWallet(userId);
-    const walletBalance = parseFloat(wallet.balance);
-    walletDebitAmount = Math.min(walletBalance, finalTotal);
-    if (walletDebitAmount < 0) walletDebitAmount = 0;
+    walletDebitAmount = Math.max(0, Math.min(parseFloat(wallet.balance), finalTotal));
   }
 
-  // 4. Build order-item snapshots from DB (price at time of order, immutable)
   const menuItemIds  = items.map(i => i.menuItemId);
-  const menuItemList = await db.select().from(menuItems)
-    .where(inArray(menuItems.id, menuItemIds));
+  const menuItemList = await db.select().from(menuItems).where(inArray(menuItems.id, menuItemIds));
   const menuItemMap  = Object.fromEntries(menuItemList.map(m => [m.id, m]));
 
   const orderItemsData = items.map(item => ({
@@ -109,7 +106,6 @@ const createOrder = async (userId, {
     totalPrice:  item.totalPrice.toFixed(2),
   }));
 
-  // 5. Atomic transaction: order INSERT + items INSERT + cart DELETE
   const client = await pool.connect();
   let createdOrderId;
 
@@ -127,20 +123,10 @@ const createOrder = async (userId, {
          idempotency_key,
          wallet_amount_used,
          created_at, updated_at
-       ) VALUES (
-         $1, $2,
-         'pending', 'pending',
-         $3, $4, $5,
-         $6,
-         $7, $8,
-         $9,
-         $10,
-         $11,
-         NOW(), NOW()
-       ) RETURNING *`,
+       ) VALUES ($1,$2,'pending','pending',$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW(),NOW())
+       RETURNING *`,
       [
-        userId,
-        cart.restaurantId,
+        userId, cart.restaurantId,
         pricing.subtotal.toFixed(2),
         totalDiscountAmount.toFixed(2),
         finalTotal.toFixed(2),
@@ -157,48 +143,24 @@ const createOrder = async (userId, {
 
     for (const oi of orderItemsData) {
       await client.query(
-        `INSERT INTO order_items (
-           order_id, menu_item_id, name, variant_name, add_ons,
-           quantity, unit_price, total_price, created_at
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())`,
-        [
-          order.id,
-          oi.menuItemId,
-          oi.name,
-          oi.variantName,
-          JSON.stringify(oi.addOns),
-          oi.quantity,
-          oi.unitPrice,
-          oi.totalPrice,
-        ]
+        `INSERT INTO order_items
+           (order_id,menu_item_id,name,variant_name,add_ons,quantity,unit_price,total_price,created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())`,
+        [order.id, oi.menuItemId, oi.name, oi.variantName,
+          JSON.stringify(oi.addOns), oi.quantity, oi.unitPrice, oi.totalPrice]
       );
     }
 
-    // Clear cart within the same transaction — atomically
     await client.query('DELETE FROM cart_items WHERE cart_id = $1', [cart.id]);
-    await client.query('DELETE FROM carts      WHERE id      = $1', [cart.id]);
+    await client.query('DELETE FROM carts WHERE id = $1', [cart.id]);
 
     await client.query('COMMIT');
-    logger.info('Order created', {
-      orderId: order.id,
-      userId,
-      total: finalTotal,
-      walletUsed: walletDebitAmount,
-      coupon: couponCode ?? null,
-      restaurantId: cart.restaurantId,
-    });
+    logger.info('Order created', { orderId: order.id, userId, total: finalTotal });
 
-    createdOrderId = order.id;
-
-    // Post-commit side-effects (non-blocking)
-    // Debit wallet if used
     if (walletDebitAmount > 0) {
-      walletService.debitWallet(
-        userId, walletDebitAmount, order.id, 'Order payment'
-      ).catch(err => logger.error('Wallet debit failed post-commit', { error: err.message, orderId: order.id }));
+      walletService.debitWallet(userId, walletDebitAmount, order.id, 'Order payment')
+        .catch(err => logger.error('Wallet debit failed post-commit', { error: err.message, orderId: order.id }));
     }
-
-    // Record coupon usage
     if (couponData) {
       couponService.recordCouponUsage(couponData.coupon.id, userId, order.id)
         .catch(err => logger.error('Coupon usage record failed', { error: err.message }));
@@ -215,20 +177,33 @@ const createOrder = async (userId, {
   return getOrderById(createdOrderId, userId);
 };
 
-// ─── Get user's own orders ────────────────────────────────────────────────────
+// ─── Get user's orders WITH restaurant name + items (no N+1) ─────────────────
+/**
+ * Returns orders enriched with:
+ *   - restaurantName: string
+ *   - items:          OrderItem[]
+ *
+ * Query strategy (3 queries total regardless of page size):
+ *   Q1: SELECT orders WHERE user_id = ? LIMIT N
+ *   Q2: SELECT id,name FROM restaurants WHERE id IN (unique restaurant IDs from Q1)
+ *   Q3: SELECT * FROM order_items WHERE order_id IN (all order IDs from Q1)
+ *
+ * Then assemble in JavaScript — zero N+1.
+ */
 const getOrders = async (userId, page = 1, limit = 10) => {
   const safeLimit  = Math.min(parseInt(limit)  || 10, 50);
   const safeOffset = (Math.max(1, parseInt(page)) - 1) * safeLimit;
 
-  logger.debug('getOrders', { userId, page, limit: safeLimit });
-
-  return db.select({
+  // Q1: Fetch order rows
+  const orderRows = await db.select({
     id:              orders.id,
     status:          orders.status,
     paymentStatus:   orders.paymentStatus,
     subtotal:        orders.subtotal,
     discountAmount:  orders.discountAmount,
     totalAmount:     orders.totalAmount,
+    walletAmountUsed: orders.walletAmountUsed,
+    couponCode:      orders.couponCode,
     preparationTime: orders.preparationTime,
     restaurantId:    orders.restaurantId,
     pickupName:      orders.pickupName,
@@ -241,40 +216,160 @@ const getOrders = async (userId, page = 1, limit = 10) => {
     .orderBy(desc(orders.createdAt))
     .limit(safeLimit)
     .offset(safeOffset);
+
+  if (orderRows.length === 0) return [];
+
+  // Q2: Batch-fetch restaurant names (single IN query, no N+1)
+  const restaurantIds = [...new Set(orderRows.map(o => o.restaurantId).filter(Boolean))];
+  const restaurantRows = restaurantIds.length
+    ? await db.select({ id: restaurants.id, name: restaurants.name })
+        .from(restaurants)
+        .where(inArray(restaurants.id, restaurantIds))
+    : [];
+  const restaurantMap = Object.fromEntries(restaurantRows.map(r => [r.id, r.name]));
+
+  // Q3: Batch-fetch all order items for these orders (single IN query, no N+1)
+  const orderIds = orderRows.map(o => o.id);
+  const itemRows = await db.select().from(orderItems)
+    .where(inArray(orderItems.orderId, orderIds));
+
+  // Group items by orderId
+  const itemsByOrderId = itemRows.reduce((acc, item) => {
+    if (!acc[item.orderId]) acc[item.orderId] = [];
+    acc[item.orderId].push(item);
+    return acc;
+  }, {});
+
+  // Assemble enriched response
+  return orderRows.map(order => ({
+    ...order,
+    restaurantName: restaurantMap[order.restaurantId] ?? 'Unknown Restaurant',
+    items: itemsByOrderId[order.id] ?? [],
+  }));
 };
 
 // ─── Get single order (with items) ───────────────────────────────────────────
 const getOrderById = async (orderId, userId = null) => {
   const conditions = [eq(orders.id, orderId)];
-
-  // #4 — always filter by userId when provided; log a clear debug line so
-  // "order not found after re-login" is immediately diagnosable in server logs.
   if (userId) {
     logger.debug('getOrderById', { orderId, filterUserId: userId });
     conditions.push(eq(orders.userId, userId));
   }
 
   const [order] = await db.select().from(orders)
-    .where(and(...conditions))
-    .limit(1);
+    .where(and(...conditions)).limit(1);
 
   if (!order) {
-    // #4 — surface userId in the error log so operator can cross-check
     logger.warn('getOrderById: not found', { orderId, userId: userId ?? 'admin-bypass' });
     throw new AppError('Order not found', 404);
   }
 
-  const items = await db.select().from(orderItems)
+  const items = await db.select().from(orderItems).where(eq(orderItems.orderId, orderId));
+
+  // Fetch restaurant name for single-order view as well
+  const [restaurant] = await db.select({ id: restaurants.id, name: restaurants.name })
+    .from(restaurants).where(eq(restaurants.id, order.restaurantId)).limit(1);
+
+  return {
+    ...order,
+    restaurantName: restaurant?.name ?? 'Unknown Restaurant',
+    items,
+  };
+};
+
+// ─── Reorder from a past order ────────────────────────────────────────────────
+/**
+ * reorderFromPastOrder(orderId, userId)
+ *
+ * Validates each past order item, adds available ones to cart, and returns a
+ * summary of what was added and what was skipped (unavailable/deleted items).
+ *
+ * Idempotency: calls addToCart which deduplicates by (menuItemId, variantId, addOns).
+ *
+ * @returns {{ added: {name, qty}[], skipped: {name, reason}[] }}
+ */
+const reorderFromPastOrder = async (orderId, userId) => {
+  // 1. Fetch past order + items
+  const [order] = await db.select().from(orders)
+    .where(and(eq(orders.id, orderId), eq(orders.userId, userId))).limit(1);
+
+  if (!order) throw new AppError('Order not found', 404);
+
+  const pastItems = await db.select().from(orderItems)
     .where(eq(orderItems.orderId, orderId));
 
-  return { ...order, items };
+  if (!pastItems.length) throw new AppError('This order has no items', 400);
+
+  // 2. Check restaurant is still active
+  const [restaurant] = await db.select().from(restaurants)
+    .where(eq(restaurants.id, order.restaurantId)).limit(1);
+
+  if (!restaurant) throw new AppError('Restaurant no longer exists', 400);
+  if (!restaurant.isActive) throw new AppError('This restaurant is currently closed', 400);
+
+  // 3. Batch-validate menu items still exist and are available
+  const menuItemIds = pastItems.map(i => i.menuItemId);
+  const currentMenuItems = await db.select().from(menuItems)
+    .where(inArray(menuItems.id, menuItemIds));
+  const availabilityMap = Object.fromEntries(
+    currentMenuItems.map(m => [m.id, { available: m.isAvailable, name: m.name }])
+  );
+
+  const added   = [];
+  const skipped = [];
+
+  // 4. Add each available item to cart
+  for (const pastItem of pastItems) {
+    const current = availabilityMap[pastItem.menuItemId];
+
+    if (!current) {
+      skipped.push({ name: pastItem.name, reason: 'Item no longer available' });
+      continue;
+    }
+    if (!current.available) {
+      skipped.push({ name: pastItem.name, reason: 'Currently unavailable' });
+      continue;
+    }
+
+    try {
+      // addToCart is server-authoritative — it re-validates price from DB
+      await cartService.addToCart(userId, {
+        menuItemId: pastItem.menuItemId,
+        variantId:  pastItem.variantName ? undefined : undefined, // variants are snapshotted by name, not ID
+        addOnIds:   [], // add-ons from past orders are snapshotted; can't re-reference by ID safely
+        quantity:   pastItem.quantity,
+      });
+      added.push({ name: pastItem.name, quantity: pastItem.quantity });
+    } catch (err) {
+      logger.warn('reorder: failed to add item', { menuItemId: pastItem.menuItemId, err: err.message });
+      // Cross-restaurant guard or availability check failed — skip gracefully
+      if (err.message?.includes('different restaurant')) {
+        // Stop processing — cart has items from another restaurant
+        throw new AppError(
+          'Your cart has items from a different restaurant. Clear your cart first, then reorder.',
+          400
+        );
+      }
+      skipped.push({ name: pastItem.name, reason: err.message ?? 'Could not add to cart' });
+    }
+  }
+
+  logger.info('Reorder complete', { orderId, userId, added: added.length, skipped: skipped.length });
+
+  return {
+    added,
+    skipped,
+    restaurantName: restaurant.name,
+    message: added.length
+      ? `Added ${added.length} item${added.length > 1 ? 's' : ''} to your cart${skipped.length ? ` (${skipped.length} skipped)` : ''}.`
+      : 'No items could be added — all items are currently unavailable.',
+  };
 };
 
 // ─── Cancel order (user-initiated) ───────────────────────────────────────────
 const cancelOrder = async (orderId, userId) => {
   const [order] = await db.select().from(orders)
-    .where(and(eq(orders.id, orderId), eq(orders.userId, userId)))
-    .limit(1);
+    .where(and(eq(orders.id, orderId), eq(orders.userId, userId))).limit(1);
 
   if (!order) throw new AppError('Order not found', 404);
 
@@ -298,10 +393,7 @@ const cancelOrder = async (orderId, userId) => {
 
 // ─── Update order status (admin path) ────────────────────────────────────────
 const updateOrderStatus = async (orderId, newStatus, preparationTime) => {
-  const [order] = await db.select().from(orders)
-    .where(eq(orders.id, orderId))
-    .limit(1);
-
+  const [order] = await db.select().from(orders).where(eq(orders.id, orderId)).limit(1);
   if (!order) throw new AppError('Order not found', 404);
 
   const allowed = STATE_TRANSITIONS[order.status];
@@ -318,16 +410,8 @@ const updateOrderStatus = async (orderId, newStatus, preparationTime) => {
   const updateData = { status: newStatus, updatedAt: new Date() };
   if (preparationTime != null) updateData.preparationTime = preparationTime;
 
-  const [updated] = await db.update(orders)
-    .set(updateData)
-    .where(eq(orders.id, orderId))
-    .returning();
-
-  logger.info('Order status updated (admin)', {
-    orderId,
-    from: order.status,
-    to: newStatus,
-  });
+  const [updated] = await db.update(orders).set(updateData).where(eq(orders.id, orderId)).returning();
+  logger.info('Order status updated (admin)', { orderId, from: order.status, to: newStatus });
   return updated;
 };
 
@@ -337,17 +421,15 @@ const getAllOrders = async ({ page = 1, limit = 20, status } = {}) => {
   const safeOffset = (Math.max(1, parseInt(page)) - 1) * safeLimit;
   const where = status ? eq(orders.status, status) : undefined;
 
-  return db.select().from(orders)
-    .where(where)
-    .orderBy(desc(orders.createdAt))
-    .limit(safeLimit)
-    .offset(safeOffset);
+  return db.select().from(orders).where(where)
+    .orderBy(desc(orders.createdAt)).limit(safeLimit).offset(safeOffset);
 };
 
 module.exports = {
   createOrder,
   getOrders,
   getOrderById,
+  reorderFromPastOrder,
   cancelOrder,
   updateOrderStatus,
   getAllOrders,

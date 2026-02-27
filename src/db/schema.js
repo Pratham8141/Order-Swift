@@ -105,6 +105,7 @@ const restaurants = pgTable('restaurants', {
   latitude:     decimal('latitude',  { precision: 10, scale: 7 }),
   longitude:    decimal('longitude', { precision: 10, scale: 7 }),
   cuisines:     jsonb('cuisines').default([]),
+  termsAcceptedAt: timestamp("terms_accepted_at"),  // NULL = not accepted yet
   createdAt:    timestamp('created_at').defaultNow().notNull(),
   updatedAt:    timestamp('updated_at').defaultNow().notNull(),
 }, (t) => ({

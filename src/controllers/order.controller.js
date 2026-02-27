@@ -23,13 +23,17 @@ const cancelOrder = asyncHandler(async (req, res) =>
   sendSuccess(res, await orderService.cancelOrder(req.params.id, req.user.id), 'Order cancelled')
 );
 
+const reorder = asyncHandler(async (req, res) => {
+  const result = await orderService.reorderFromPastOrder(req.params.id, req.user.id);
+  sendSuccess(res, result, result.message);
+});
+
 // Admin
 const adminGetOrders = asyncHandler(async (req, res) =>
   sendSuccess(res, await orderService.getAllOrders(req.query))
 );
 
-// Internal wrapper used by admin.routes.js (returns data, not response)
 const _adminUpdateStatus = (orderId, status, estimatedTime) =>
   orderService.updateOrderStatus(orderId, status, estimatedTime);
 
-module.exports = { createOrder, getOrders, getOrderById, cancelOrder, adminGetOrders, _adminUpdateStatus };
+module.exports = { createOrder, getOrders, getOrderById, cancelOrder, reorder, adminGetOrders, _adminUpdateStatus };
