@@ -24,7 +24,7 @@
  */
 const { db, pool }   = require('../db');
 const {
-  orders, orderItems, restaurants, menuItems,
+  orders, orderItems, restaurants, menuItems, menuItemVariants, addOns,
 } = require('../db/schema');
 const { eq, and, desc, inArray } = require('drizzle-orm');
 const { AppError }   = require('../utils/response');
@@ -332,12 +332,42 @@ const reorderFromPastOrder = async (orderId, userId) => {
     }
 
     try {
-      // addToCart is server-authoritative — it re-validates price from DB
+      // Resolve variantId by name — orderItems stores variantName snapshot, not variantId.
+      // Look up the current variant UUID from menu_item_variants table.
+      let resolvedVariantId = null;
+      if (pastItem.variantName) {
+        const [variant] = await db.select({ id: menuItemVariants.id })
+          .from(menuItemVariants)
+          .where(
+            and(
+              eq(menuItemVariants.menuItemId, pastItem.menuItemId),
+              eq(menuItemVariants.name, pastItem.variantName)
+            )
+          ).limit(1);
+        resolvedVariantId = variant?.id ?? null;
+      }
+
+      // Resolve addOnIds — addOns are stored as [{addOnId, name, price}] snapshots.
+      // Re-validate that the add-on still exists and belongs to this item.
+      const storedAddOns = Array.isArray(pastItem.addOns) ? pastItem.addOns : [];
+      let resolvedAddOnIds = [];
+      if (storedAddOns.length > 0) {
+        const candidateIds = storedAddOns.map(a => a.addOnId).filter(Boolean);
+        if (candidateIds.length > 0) {
+          const validAddOns = await db.select({ id: addOns.id })
+            .from(addOns)
+            .where(and(inArray(addOns.id, candidateIds), eq(addOns.isAvailable, true)));
+          resolvedAddOnIds = validAddOns.map(a => a.id);
+        }
+      }
+
+      // addToCart is server-authoritative — it re-validates price from DB.
+      // quantity: pastItem.quantity restores the original quantity (FIX: was always 1).
       await cartService.addToCart(userId, {
         menuItemId: pastItem.menuItemId,
-        variantId:  pastItem.variantName ? undefined : undefined, // variants are snapshotted by name, not ID
-        addOnIds:   [], // add-ons from past orders are snapshotted; can't re-reference by ID safely
-        quantity:   pastItem.quantity,
+        variantId:  resolvedVariantId,
+        addOnIds:   resolvedAddOnIds,
+        quantity:   pastItem.quantity,  // ← CRITICAL: restore original quantity
       });
       added.push({ name: pastItem.name, quantity: pastItem.quantity });
     } catch (err) {
