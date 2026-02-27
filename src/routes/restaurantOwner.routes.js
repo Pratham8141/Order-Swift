@@ -177,6 +177,20 @@ router.put('/restaurant', asyncHandler(async (req, res) => {
   return sendSuccess(res, updated, 'Restaurant updated');
 }));
 
+/**
+ * PATCH /api/v1/owner/restaurant/toggle-active
+ * Quickly toggle isActive without sending full payload.
+ */
+router.patch('/restaurant/toggle-active', asyncHandler(async (req, res) => {
+  const restaurant = await getOwnedRestaurant(req.user.id);
+  const [updated] = await db
+    .update(restaurants)
+    .set({ isActive: !restaurant.isActive, updatedAt: new Date() })
+    .where(eq(restaurants.id, restaurant.id))
+    .returning();
+  return sendSuccess(res, updated, `Restaurant is now ${updated.isActive ? 'active' : 'inactive'}`);
+}));
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // MENU MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -337,7 +351,22 @@ router.get('/orders', asyncHandler(async (req, res) => {
     .limit(limit)
     .offset(offset);
 
-  return sendSuccess(res, { orders: data, page, limit });
+  // Batch-fetch order items for all returned orders (single IN query)
+  let itemsMap = {};
+  if (data.length > 0) {
+    const orderIds = data.map(o => o.id);
+    const allItems = await db
+      .select()
+      .from(orderItems)
+      .where(inArray(orderItems.orderId, orderIds));
+    for (const item of allItems) {
+      if (!itemsMap[item.orderId]) itemsMap[item.orderId] = [];
+      itemsMap[item.orderId].push(item);
+    }
+  }
+
+  const ordersWithItems = data.map(o => ({ ...o, items: itemsMap[o.id] ?? [] }));
+  return sendSuccess(res, { orders: ordersWithItems, page, limit });
 }));
 
 /**

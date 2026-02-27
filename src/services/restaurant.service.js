@@ -28,20 +28,41 @@ const logger = require('../utils/logger');
  *   - Admin endpoint may pass isActive = false/undefined → unfiltered.
  *   - If isActive is undefined no condition is added (returns all).
  */
-const getRestaurants = async ({ page, limit, search, minRating, isActive }) => {
+const getRestaurants = async ({ page, limit, search, minRating, isActive, latitude, longitude, radius }) => {
   const offset = (page - 1) * limit;
 
   const conditions = [];
 
   // Only add the isActive filter when a value was explicitly provided.
-  // The fix for the Zod schema means undefined is no longer coerced to false.
   if (isActive !== undefined) {
     conditions.push(eq(restaurants.isActive, isActive));
   }
 
   if (search)     conditions.push(ilike(restaurants.name, `%${search}%`));
   if (minRating)  conditions.push(gte(restaurants.rating, minRating.toString()));
-  // maxDelivery filter removed — deliveryTime column no longer exists
+
+  // Location radius filter using Haversine formula (if lat/lng/radius provided)
+  let locationFilter = null;
+  if (latitude && longitude) {
+    const r = parseFloat(radius) || 5; // km
+    // 1 degree lat ≈ 111km, use simple bounding box first then haversine
+    const latDelta = r / 111.0;
+    const lngDelta = r / (111.0 * Math.cos(parseFloat(latitude) * Math.PI / 180));
+    const lat = parseFloat(latitude);
+    const lng = parseFloat(longitude);
+    conditions.push(
+      sql`${restaurants.latitude} IS NOT NULL AND ${restaurants.longitude} IS NOT NULL AND
+        ${restaurants.latitude}::float BETWEEN ${lat - latDelta} AND ${lat + latDelta} AND
+        ${restaurants.longitude}::float BETWEEN ${lng - lngDelta} AND ${lng + lngDelta} AND
+        (
+          6371 * 2 * ASIN(SQRT(
+            POWER(SIN((${restaurants.latitude}::float - ${lat}) * PI() / 360), 2) +
+            COS(${lat} * PI() / 180) * COS(${restaurants.latitude}::float * PI() / 180) *
+            POWER(SIN((${restaurants.longitude}::float - ${lng}) * PI() / 360), 2)
+          ))
+        ) <= ${r}`
+    );
+  }
 
   const where = conditions.length > 0 ? and(...conditions) : undefined;
 
@@ -55,12 +76,14 @@ const getRestaurants = async ({ page, limit, search, minRating, isActive }) => {
       bannerImage:     restaurants.bannerImage,
       rating:          restaurants.rating,
       totalReviews:    restaurants.totalReviews,
-      preparationTime: restaurants.preparationTime,   // ← renamed from deliveryTime
+      preparationTime: restaurants.preparationTime,
       minOrder:        restaurants.minOrder,
       isActive:        restaurants.isActive,
       openingTime:     restaurants.openingTime,
       closingTime:     restaurants.closingTime,
       cuisines:        restaurants.cuisines,
+      latitude:        restaurants.latitude,
+      longitude:       restaurants.longitude,
     })
       .from(restaurants)
       .where(where)
