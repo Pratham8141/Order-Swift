@@ -66,7 +66,8 @@ const createOrder = async (userId, {
   const [restaurant] = await db.select().from(restaurants)
     .where(eq(restaurants.id, cart.restaurantId)).limit(1);
   if (!restaurant)          throw new AppError('Restaurant not found', 404);
-  if (!restaurant.isActive) throw new AppError('This restaurant is currently closed', 400);
+  if (!restaurant.isActive) throw new AppError('This restaurant is currently not available', 400);
+  if (restaurant.isOpen === false) throw new AppError('This restaurant is currently not accepting orders', 400);
 
   const minOrder = parseFloat(restaurant.minOrder || 0);
   if (pricing.subtotal < minOrder) {
@@ -396,26 +397,65 @@ const reorderFromPastOrder = async (orderId, userId) => {
   };
 };
 
-// ─── Cancel order (user-initiated) ───────────────────────────────────────────
+// ─── Cancel order (user-initiated) with wallet refund ────────────────────────
 const cancelOrder = async (orderId, userId) => {
   const [order] = await db.select().from(orders)
     .where(and(eq(orders.id, orderId), eq(orders.userId, userId))).limit(1);
 
   if (!order) throw new AppError('Order not found', 404);
 
-  const cancellable = ['pending', 'paid', 'confirmed'];
+  // FIX: Only pending and paid orders can be cancelled by the user.
+  // Once confirmed/preparing/ready, the restaurant is working on it.
+  const cancellable = ['pending', 'paid'];
   if (!cancellable.includes(order.status)) {
     throw new AppError(
-      `Cannot cancel — order is already '${order.status}'. ` +
-      `Only pending, paid, or confirmed orders can be cancelled.`,
+      `Cannot cancel — order is '${order.status}'. ` +
+      `Only pending or paid orders can be cancelled. Once confirmed by the restaurant, cancellation is not allowed.`,
       400
     );
   }
 
-  const [updated] = await db.update(orders)
-    .set({ status: 'cancelled', updatedAt: new Date() })
-    .where(eq(orders.id, orderId))
-    .returning();
+  const client = await pool.connect();
+  let updated;
+  try {
+    await client.query('BEGIN');
+
+    const { rows: [cancelledOrder] } = await client.query(
+      `UPDATE orders SET status = 'cancelled', updated_at = NOW() WHERE id = $1 RETURNING *`,
+      [orderId]
+    );
+    updated = cancelledOrder;
+
+    // FIX: Refund wallet amount if it was used for this order
+    const walletUsed = parseFloat(order.walletAmountUsed || '0');
+    if (walletUsed > 0) {
+      // Ensure wallet row exists
+      await client.query(
+        `INSERT INTO wallets (user_id, balance) VALUES ($1, 0) ON CONFLICT (user_id) DO NOTHING`,
+        [userId]
+      );
+      // Credit wallet
+      const { rows: [wallet] } = await client.query(
+        `UPDATE wallets SET balance = balance + $1, updated_at = NOW() WHERE user_id = $2 RETURNING *`,
+        [walletUsed.toFixed(2), userId]
+      );
+      // Record transaction
+      await client.query(
+        `INSERT INTO wallet_transactions (user_id, type, amount, description, reference_id, balance_after)
+         VALUES ($1, 'credit', $2, 'Order Cancel Refund', $3, $4)`,
+        [userId, walletUsed.toFixed(2), orderId, wallet.balance]
+      );
+      logger.info('Wallet refunded on order cancel', { orderId, userId, amount: walletUsed });
+    }
+
+    await client.query('COMMIT');
+  } catch (err) {
+    await client.query('ROLLBACK');
+    logger.error('Cancel order rollback', { error: err.message, orderId, userId });
+    throw err;
+  } finally {
+    client.release();
+  }
 
   logger.info('Order cancelled by user', { orderId, userId });
   return updated;

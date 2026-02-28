@@ -11,7 +11,7 @@ const addReview = async (userId, { restaurantId, orderId, rating, comment }) => 
 
     if (!order) throw new AppError('Order not found', 404);
     if (order.restaurantId !== restaurantId) throw new AppError('Order does not belong to this restaurant', 400);
-    if (order.status !== 'delivered') throw new AppError('Can only review delivered orders', 400);
+    if (order.status !== 'collected') throw new AppError('Can only review collected (completed) orders', 400);
   }
 
   const [review] = await db.insert(reviews)
