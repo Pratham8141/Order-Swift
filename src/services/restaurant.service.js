@@ -79,6 +79,7 @@ const getRestaurants = async ({ page, limit, search, minRating, isActive, latitu
       preparationTime: restaurants.preparationTime,
       minOrder:        restaurants.minOrder,
       isActive:        restaurants.isActive,
+      isOpen:          restaurants.isOpen,
       openingTime:     restaurants.openingTime,
       closingTime:     restaurants.closingTime,
       cuisines:        restaurants.cuisines,

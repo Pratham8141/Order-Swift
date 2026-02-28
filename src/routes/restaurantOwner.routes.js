@@ -18,7 +18,7 @@ const { db }                              = require('../db');
 const {
   restaurants, categories, menuItems, orders, orderItems,
 } = require('../db/schema');
-const { eq, and, desc } = require('drizzle-orm');
+const { eq, and, desc, inArray } = require('drizzle-orm');
 const logger = require('../utils/logger');
 const { notifyOrderStatusChange } = require('../utils/notifications');
 
@@ -154,6 +154,7 @@ router.put('/restaurant', asyncHandler(async (req, res) => {
     'preparationTime',
     'minOrder',
     'isActive',
+    'isOpen',
     'openingTime', 'closingTime',
     'address', 'latitude', 'longitude',
     'cuisines',
@@ -189,6 +190,21 @@ router.patch('/restaurant/toggle-active', asyncHandler(async (req, res) => {
     .where(eq(restaurants.id, restaurant.id))
     .returning();
   return sendSuccess(res, updated, `Restaurant is now ${updated.isActive ? 'active' : 'inactive'}`);
+}));
+
+/**
+ * PATCH /api/v1/owner/restaurant/toggle-open
+ * Quickly toggle isOpen (taking orders now).
+ */
+router.patch('/restaurant/toggle-open', asyncHandler(async (req, res) => {
+  const restaurant = await getOwnedRestaurant(req.user.id);
+  const newIsOpen = req.body.isOpen !== undefined ? req.body.isOpen : !restaurant.isOpen;
+  const [updated] = await db
+    .update(restaurants)
+    .set({ isOpen: newIsOpen, updatedAt: new Date() })
+    .where(eq(restaurants.id, restaurant.id))
+    .returning();
+  return sendSuccess(res, updated, `Restaurant is now ${updated.isOpen ? 'taking orders' : 'closed'}`);
 }));
 
 // ═══════════════════════════════════════════════════════════════════════════════

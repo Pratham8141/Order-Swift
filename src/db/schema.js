@@ -99,6 +99,7 @@ const restaurants = pgTable('restaurants', {
   preparationTime: integer('preparation_time').default(20),
   minOrder:     decimal('min_order', { precision: 8, scale: 2 }).default('0.00'),
   isActive:     boolean('is_active').default(true).notNull(),
+  isOpen:       boolean('is_open').default(true).notNull(),
   openingTime:  varchar('opening_time', { length: 5 }).default('09:00'),
   closingTime:  varchar('closing_time', { length: 5 }).default('22:00'),
   address:      text('address'),
