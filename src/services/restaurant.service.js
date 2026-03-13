@@ -114,8 +114,27 @@ const getRestaurantById = async (id) => {
 const getMenu = async (restaurantId) => {
   logger.debug('getMenu', { restaurantId }); // #9
 
+  // FIX Issue 1: Select ALL fields so restaurant detail page can show
+  // rating, reviewCount, open/close status, hours, etc.
   const [restaurant] = await db
-    .select({ id: restaurants.id, name: restaurants.name, isActive: restaurants.isActive })
+    .select({
+      id:              restaurants.id,
+      name:            restaurants.name,
+      description:     restaurants.description,
+      bannerImage:     restaurants.bannerImage,
+      rating:          restaurants.rating,
+      totalReviews:    restaurants.totalReviews,
+      preparationTime: restaurants.preparationTime,
+      minOrder:        restaurants.minOrder,
+      isActive:        restaurants.isActive,
+      isOpen:          restaurants.isOpen,
+      openingTime:     restaurants.openingTime,
+      closingTime:     restaurants.closingTime,
+      cuisines:        restaurants.cuisines,
+      latitude:        restaurants.latitude,
+      longitude:       restaurants.longitude,
+      address:         restaurants.address,
+    })
     .from(restaurants)
     .where(eq(restaurants.id, restaurantId))
     .limit(1);
